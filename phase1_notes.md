@@ -509,6 +509,90 @@ not required to be correct yet.
 
 ---
 
+## Phase 1b: Final Hypothesis (for testing against Phase 1c)
+
+- **PE array**: **128×128** (`d_head` × k-sub-tile) as the primary
+  hypothesis — matches Trainium precedent exactly. **128×256 carried as an
+  explicit alternate**, to test whether the ~2× pass-count reduction through
+  the scratchpad-resident k-tile is worth ~2× the array area/power; no
+  utilization conflict expected between QK^T and ·V at either size.
+- **Dataflow**: weight-stationary, with **K and V as the stationary
+  operand** in their respective matmuls (QK^T and ·V) — driven by the 8×
+  reuse factor (`num_q_heads/num_k_heads`) across the group of query heads
+  sharing one KV head; Q streamed (no cross-head reuse to exploit). The same
+  physical array serves both matmuls because `d_head` anchors the spatial
+  pair in both, just potentially transposed.
+- **Scratchpad** (Gemmini default, ≤1 MiB): holds double-buffered K/V chunks
+  (`tile_k`=1024) + P tile + Q tile + output tile ≈ 565 KB, leaving headroom.
+- **Accumulator** (Gemmini default, ≤256 KiB): holds per-head online-softmax
+  tracking state (running max + running sum + partial output accumulator,
+  fp32) for the group of 8 query heads sharing one KV head; `tile_q`=32.
+- **Stated assumptions carried into 1c/1d:** (a) array/feed logic can route
+  either GEMM dimension onto either physical axis between the QK^T and ·V
+  phases; (b) fp32 for online-softmax tracking state (revisit at fp16 in
+  Phase 3); (c) double-buffering assumed for K/V but not for Q/output.
+- **Predictions to check against Timeloop:** does the mapper's near-optimal
+  config land closer to 128×128 or 128×256? Does it find `tile_k`/`tile_q`
+  close to the hand-derived 1024/32, or reveal a consideration missed here?
+  This is the first concrete hand-vs-tool comparison point for Phase 1b,
+  mirroring the fused/unfused prediction from Phase 1a.
+
+---
+
+## Key Takeaways (Phase 1b) — for final writeup
+
+1. **Array sizing is governed by real hardware precedent and dataflow-driven
+   reuse, not workload scale.** `seq_len` (8192) never appears directly in
+   the array's shape at any level — it gets tiled away twice, first to a
+   scratchpad-resident chunk, then again to an array-sized sub-tile — a
+   pattern that repeated itself once you knew to look for it.
+2. **Dataflow and array shape aren't separable questions.** "What shape
+   should the array be" has no answer until "which operand is stationary"
+   is fixed, since the dataflow choice determines which GEMM dimensions even
+   compete for the array's two physical axes.
+3. **`d_head` being shared across every operand (Q, K, V) is why one
+   physical array serves both QK^T and ·V cleanly** under weight-stationary
+   — a structural property of attention's shape, discovered by working out
+   each matmul's spatial/temporal split independently and noticing they
+   matched, not assumed in advance.
+4. **Scratchpad and accumulator are separate physical resources with
+   different natural occupants**, mirroring the Phase 1a precision
+   decision directly onto physical memory placement: scratchpad holds int8
+   stationary/streamed data (K, V, Q, P, output); accumulator holds the
+   higher-precision partial-sum/tracking state.
+5. **Tiling is a two-level phenomenon, easy to conflate.** Workload scale
+   (`seq_len`) reduces to a scratchpad-resident chunk under one budget
+   (scratchpad capacity), then that chunk reduces again to an array-sized
+   sub-tile under a second, independent budget (real array size) — catching
+   the conflation was itself one of the most useful moments in Phase 1b.
+6. **When a tradeoff can't be solved exactly (no real area/power budget for
+   square vs. 128×256), state a defensible primary hypothesis plus an
+   explicit alternate** rather than forcing a single answer — especially
+   when the tool you're about to use (Timeloop) sweeps exactly that
+   dimension anyway.
+7. **GQA's benefit is regime-dependent in two distinct ways**, discovered
+   across Phase 1a and 1b respectively: Amdahl's-Law-style (fused vs.
+   unfused bytes-moved) and roofline-position-style (fused prefill's
+   compute-bound time isn't helped by GQA at all — its real payoff there is
+   scratchpad pressure and KV-cache footprint, not throughput).
+
+---
+
+## Open / Not Yet Done (Phase 1b)
+
+- [x] PE array shape (128×128 primary, 128×256 alternate)
+- [x] Dataflow (weight-stationary, K/V stationary, same array for both
+      matmuls)
+- [x] Scratchpad sizing (`tile_k`=1024)
+- [x] Accumulator sizing (`tile_q`=32)
+- [ ] Verify the array axis-routing/transpose assumption against actual
+      Gemmini capability (Phase 1d)
+- [ ] Test 128×128 vs. 128×256 against Timeloop's actual sweep (Phase 1c)
+
+**Phase 1b: complete.** Ready for Phase 1c (Timeloop sweep).
+
+---
+
 ## Log
 
 - Derived QK^T FLOPs (MHA) — confirmed via M/N/K decomposition.
@@ -628,3 +712,31 @@ not required to be correct yet.
   payoff there is scratchpad pressure and KV-cache footprint, not raw
   throughput; decode should be the regime where the throughput win actually
   shows up. Added as Key Takeaway #7, direct material for Phase 2 comparison.
+- Solved the full scratchpad inventory (2×K, 2×V double-buffered, P, Q,
+  output tiles) for `tile_k` against the 1 MiB Gemmini scratchpad budget:
+  max ≈1,912 elements exactly, `tile_k`=1024 as the practical choice.
+- Caught a second, independent layer of tiling: `tile_k`=1024 is itself far
+  bigger than any realistic array physical size (~128–256) — `tile_k` is a
+  scratchpad-residency number, not an array dimension; the array sweeps
+  through it in further sub-passes, mirroring the original seq_len→array
+  relationship one level down.
+- Built up systolic-array dataflow mechanics from first principles (which 2
+  of a GEMM's M/N/K are spatial vs. temporal defines weight-/output-/
+  input-stationary) after getting stuck reasoning about d_head's role by
+  analogy alone.
+- Applied that framework to both matmuls under the already-chosen K/V-
+  stationary dataflow: QK^T and ·V both resolve to the identical spatial
+  pair (`d_head`, k-tile), just transposed — resolving the d_head-role
+  question and confirming one physical array serves both matmuls without a
+  cross-matmul utilization conflict (given an array/feed-routing assumption,
+  stated explicitly and carried into Phase 1d).
+- Resolved the square-(128×128)-vs-wide-(128×256) array question: no exact
+  area/power budget exists to decide it definitively, and array width is
+  itself a Timeloop 1c sweep dimension — locked in 128×128 as the primary
+  hypothesis (real Trainium precedent) with 128×256 as an explicit alternate
+  to test, rather than forcing one answer.
+- **Phase 1b fully consolidated**: added a "Final Hypothesis" section (PE
+  array, dataflow, scratchpad/accumulator sizing, stated assumptions,
+  predictions to check), a "Key Takeaways" section (7 points) for the final
+  writeup, and an Open/Not-Yet-Done checklist, mirroring Phase 1a's
+  structure. **Phase 1b complete — ready for Phase 1c (Timeloop sweep).**
