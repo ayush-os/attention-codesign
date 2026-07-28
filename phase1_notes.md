@@ -356,6 +356,159 @@ Unfused P-traffic = **512 GiB** (unchanged from MHA).
 
 ---
 
+## Phase 1b: Hardware Hypothesis (PE Array, Dataflow, Scratchpad Sizing)
+
+Goal (per spec): a defensible hypothesis to test against Timeloop in 1c —
+not required to be correct yet.
+
+### 1. PE array shape
+
+- Initial instinct: size the array to match the full GEMM dims directly
+  (e.g. 8192×8192 for QK^T). **Rejected** after sanity-checking against real
+  hardware: TPU MXU 256×256, Trainium 128×128, Nvidia tensor core ~16×16 —
+  all orders of magnitude smaller than `seq_len`. Array size is a hardware
+  design choice, independent of workload dimensions; `seq_len` must instead
+  be tiled to pass through a much smaller array.
+- `d_head` = 128 identified as a strong candidate for one array axis: it's a
+  fixed dimension native to Q/K/V's own tensor shape (not workload-scale-
+  dependent like `seq_len`), and appears in *both* matmuls — as the
+  contraction dim (K) in QK^T, and as the output dim (N) in ·V.
+- **Resolved via first-principles systolic-array framework:** a systolic
+  array can only make 2 of a GEMM's (M,N,K) dims spatial at once; the
+  dataflow name (weight-/output-/input-stationary) *is* the choice of which
+  pair, and the 3rd dim streams/accumulates over time regardless of its
+  size. Worked out, under the K/V-stationary choice from §2 (a
+  weight-stationary framing): QK^T → spatial = (`d_head`, `seq_len_k`-tile),
+  temporal = `seq_len_q`; ·V → spatial = (`seq_len_k`-tile, `d_head`),
+  temporal = `seq_len_q`. **Both matmuls need the identical pair of axis
+  sizes** (`d_head`, k-tile), just potentially transposed — a direct
+  consequence of `d_head` being the one dimension shared by every operand
+  (Q, K, V) under weight-stationary, not a coincidence. This resolves the
+  d_head-role question: no cross-matmul utilization conflict, **provided**
+  the array/feed logic can route either GEMM dimension onto either physical
+  axis between the two matmul phases (stated assumption, not yet verified
+  against real Gemmini capability — carry into Phase 1d).
+- **Second array axis, decided:** no real area/power budget exists to solve
+  this exactly, and array width is itself one of Timeloop's 1c sweep
+  dimensions — so rather than force a single number, **locked in 128×128 as
+  the primary hypothesis** (matches Trainium precedent exactly, not just an
+  aesthetic "arrays are square" guess) **with 128×256 carried as an explicit
+  alternate** to test (roughly halves the passes needed through the
+  scratchpad-resident k-tile at ~2× array area/power cost; no new
+  utilization penalty found between QK^T and ·V at either size).
+
+### 2. Dataflow
+
+- Defined "stationary" concretely: which of a GEMM's M/N/K dims sit
+  *spatially* on the array (loaded once, fixed across many cycles) vs.
+  stream through *temporally* — this is the literal content of
+  weight-/output-/input-stationary, not just a label.
+- **MHA**: no cross-head reuse for either Q or K (each head has unique data)
+  → dataflow choice doesn't matter for MHA from a reuse standpoint.
+- **GQA**: K (and, by identical logic, V) are reused across the group of
+  `num_q_heads / num_k_heads` = 8 query heads sharing one KV head.
+  **Concluded: K/V stationary, Q streamed** — directly the same reuse factor
+  (8×) that drove the Phase 1a GQA byte savings, not a separately-derived
+  fact.
+- Self-corrected an initial inversion ("streaming K/V saves memory
+  traffic") once explicitly tied back to the Phase 1a mechanism: reuse
+  *without* re-fetching = stationary, not streaming. Also reasoned that
+  Q being the larger tensor argues *against* making it stationary (no reuse
+  benefit, more scratchpad cost for nothing) — same conclusion via a second
+  angle.
+
+### 3. Scratchpad & accumulator sizing (resolved)
+
+- Distinguished array-level "stationary" (fine-grained, holds for one
+  tile-pass) from scratchpad-level residency (must span the *entire*
+  8-head group for GQA's compulsory-byte claim from Phase 1a to actually
+  hold) — different levels of the memory hierarchy; conflating them was an
+  early mistake, caught and corrected.
+- First estimate: one full (batch, kv-head) K tile = `seq_len_k × d_head` =
+  2^20 = **1 MiB** at int8 — checked against realistic on-chip SRAM sizes,
+  not implausible.
+- Reconnected to the Phase 1a fused/unfused split: a **full** P tile
+  (`seq_len_q × seq_len_k`) = 2^26 = **64 MiB** per head — far too large for
+  any realistic scratchpad. Conclusion: achieving "fused" (P never touches
+  HBM, the Phase 1a compute-bound case) forces tiling of `seq_len_k`
+  (likely `seq_len_q` too) *regardless of GQA* — the two tiling
+  requirements (P-size-driven, and GQA-reuse-driven) compose rather than
+  conflict.
+- Revised resident-K/V estimate once tiled: `tile_size × d_head × 2` (K and
+  V for one chunk) — much smaller than the full 1 MiB.
+- Identified a real wrinkle: preserving GQA's KV-chunk reuse under this
+  tiling requires the loop order to hold a K/V chunk fixed while sweeping
+  across all 8 heads in the group (not finishing one head's full sweep
+  before the next, which would defeat the reuse) — this requires per-head
+  online-softmax correction/tracking state carried across the KV-chunk
+  sweep. Independently reconstructed the core idea behind Flash Attention's
+  online-softmax mechanism from first principles (memory-traffic
+  constraints), before being told the name.
+- **Real-hardware SRAM sanity check (verified via web search, not assumed):**
+  briefly considered Google's newly-announced (Apr 2026) TPU 8t/8i (128 MiB /
+  384 MiB on-chip SRAM respectively) — rejected as the sizing target, both
+  because it breaks internal consistency with the TPU v5e ridge point from
+  Phase 1a, and because it's wildly larger than anything realistically
+  RTL-simulatable in Gemmini for Phase 1d. Also checked TPU v5e's own VMEM
+  directly (128 MiB, from the same *How to Scale Your Model* source as the
+  workload) to correct an initial misremembered "32 MB." **Decision: anchor
+  scratchpad sizing to real Gemmini defaults**, not TPU-scale SRAM — verified
+  via Gemmini's GitHub/paper: base config = **256 KB scratchpad** (up to
+  ~1 MiB across banks in some configs) + **256 KB accumulator**, as two
+  *separate* physical memories, not one combined pool.
+- Resolved a conceptual question along the way: scratchpad sizing isn't
+  "whatever's left over after the PE array" — there's a principled minimum
+  (driven by the reuse pattern already derived) past which more SRAM buys no
+  further bytes-moved reduction, and Phase 1c's Timeloop sweep explicitly
+  searches memory sizing too, so an unfalsifiable "as big as possible"
+  hypothesis would give nothing to compare against that sweep.
+- **Memory-pool placement:** the K/V chunk (int8, stationary operand data)
+  belongs in **scratchpad**; the online-softmax tracking state (higher
+  precision, per Phase 1a's own fp16/32 softmax-precision decision) belongs
+  in **accumulator** — matching accumulator's architectural purpose of
+  holding higher-precision partial sums during accumulation.
+- **Per-head tracking state, resolved:** not just one number per head —
+  running max (`tile_q` elements) + running sum (`tile_q` elements) +
+  partial output accumulator (`tile_q × d_head` elements, the dominant term
+  since it scales with `d_head`=128). At fp32 (4 bytes/elem): per head =
+  `tile_q · (2 + d_head) · 4` = `520 · tile_q` bytes.
+- **Group-size clarification:** the "8" scaling the per-head state is
+  `num_q_heads / num_k_heads` (= 64/8 = 8), the number of query heads
+  sharing one KV head — **not** `num_k_heads` directly. It's a coincidence
+  of this particular shape (64 = 8²) that the group size and `num_k_heads`
+  are numerically identical; the formula must reference the group size, not
+  `num_k_heads`, for the reasoning to generalize to other shapes.
+- **Solved for `tile_q`:** `8 heads × 520 · tile_q bytes ≤ 256 KiB (262,144
+  bytes)` → `tile_q ≤ 262,144 / 4,160 ≈ 63.0` → **max tile_q = 63 elements**
+  (4160×63 = 262,080 B, fits; ×64 = 266,240 B, doesn't). Hardware-friendly
+  power-of-2 choice: **tile_q = 32**.
+- **Resolves the earlier open question:** yes, `seq_len_q` must be tiled as
+  aggressively as `seq_len_k` — the accumulator's per-head tracking cost,
+  multiplied across the group of 8, forces a ~256× reduction from 8192 down
+  to a ~32-element query tile, a far tighter constraint than the K/V-chunk
+  sizing alone would have suggested.
+- **Full scratchpad inventory (not just K/V):** enumerated every simultaneous
+  claimant on the scratchpad budget — K tile ×2 and V tile ×2
+  (double-buffered, to overlap next-chunk HBM prefetch with current-chunk
+  compute), the P/S intermediate tile, the Q staging tile (no direct
+  HBM→array datapath — everything stages through scratchpad first), and the
+  output tile before HBM writeback.
+- **Solved for `tile_k`:** with `tile_q`=32 and `d_head`=128 fixed — K×2 + V×2
+  = `512·tile_k` bytes, P (`tile_q × tile_k`) = `32·tile_k` bytes, Q + output
+  (`tile_q × d_head` each) = `4,096 + 4,096` = `8,192` bytes (fixed). Total =
+  `544·tile_k + 8,192` bytes ≤ 1 MiB (1,048,576 B) → `tile_k ≤ 1,912.5` →
+  practical **tile_k = 1024** (~565 KB used, leaving headroom in the 1 MiB
+  scratchpad budget).
+- **Second layer of tiling, caught before finalizing:** `tile_k`=1024 is
+  itself far larger than any realistic array physical size (~128–256, per
+  the earlier hardware check) — so `tile_k` is a *scratchpad-residency*
+  number, not the array's spatial dimension. The array sweeps through the
+  1024-element scratchpad-resident chunk in ~1024/128 = 8 sub-passes,
+  mirroring the original `seq_len`→array relationship one level down. This
+  directly fed the final PE-array-shape resolution in §1.
+
+---
+
 ## Log
 
 - Derived QK^T FLOPs (MHA) — confirmed via M/N/K decomposition.
@@ -428,3 +581,50 @@ Unfused P-traffic = **512 GiB** (unchanged from MHA).
   priority ordering, methodological habits, open on-chip-reuse thread).
 - **Phase 1a (MHA + GQA) fully logged and up to date.** Ready for Phase 1b
   (PE array shape, dataflow, scratchpad sizing hypothesis).
+- Rejected sizing the PE array to full GEMM dims (8192×8192) after checking
+  real hardware (TPU MXU 256×256, Trainium 128×128, Nvidia ~16×16) —
+  confirmed array size is a hardware choice independent of workload scale.
+- Identified `d_head`=128 as a candidate array axis (native to Q/K/V shape,
+  appears in both matmuls); flagged its differing role (contraction dim in
+  QK^T vs. output dim in ·V) and the second array axis as open.
+- Defined "stationary" concretely (which GEMM dim sits spatially vs. streams
+  temporally) and derived the dataflow conclusion: no reuse advantage either
+  way for MHA; K/V stationary + Q streamed for GQA, driven by the same 8×
+  reuse factor as the Phase 1a byte savings. Self-corrected an initial
+  inversion of which operand streaming actually saves traffic.
+- Verified TPU 8t/8i on-chip SRAM claim via web search (real, announced Apr
+  2026 — 128 MiB / 384 MiB) — rejected as sizing target (breaks v5e ridge-
+  point consistency; unrealistic for Gemmini RTL simulation in Phase 1d).
+- Corrected a misremembered TPU v5e VMEM figure (32 MB) to the verified 128
+  MiB, from the same workload-source book.
+- Verified real Gemmini defaults via web search: 256 KB scratchpad (up to
+  ~1 MiB across banks) + 256 KB accumulator, as separate physical memories —
+  adopted as the realistic Phase 1b sizing target instead of TPU-scale SRAM.
+- Resolved conceptual question: scratchpad sizing has a principled minimum
+  (driven by the reuse pattern), not "whatever's left over after the PE
+  array" — oversizing has no further bytes-moved benefit past that minimum,
+  and Timeloop's 1c sweep over memory sizing needs a falsifiable hypothesis
+  to compare against.
+- Placed K/V chunk in scratchpad (int8, stationary data) and online-softmax
+  tracking state in accumulator (higher precision, per Phase 1a's own
+  softmax-precision decision) — two separate pools, not one combined budget.
+- Derived per-head tracking-state composition (running max + running sum +
+  partial-output accumulator, the last being the dominant, `d_head`-scaled
+  term) and its byte formula (520·tile_q at fp32).
+- Caught and corrected a scaling error: the group size is `num_q_heads /
+  num_k_heads` (=8), not `num_k_heads` directly — numerically identical only
+  by coincidence of this shape (64=8²).
+- Solved for `tile_q` against the 256 KB accumulator budget: max ≈63
+  elements exactly, tile_q=32 as the hardware-friendly power-of-2 choice —
+  closing the earlier open question of whether `seq_len_q` needs tiling as
+  aggressively as `seq_len_k` (yes, ~256× reduction).
+- **Phase 1b scratchpad-sizing thread resolved and logged.** Remaining
+  before 1b is "closed": settle the second PE array axis (likely = the tile
+  size just derived) and the d_head-role question, then consolidate into one
+  stated hypothesis before moving to Phase 1c (Timeloop sweep).
+- Realized (unprompted, user's own catch) that GQA's fused-prefill bytes
+  reduction doesn't move the roofline time bound at all, since compute-bound
+  time is set by FLOPs alone and GQA leaves FLOPs unchanged — its real
+  payoff there is scratchpad pressure and KV-cache footprint, not raw
+  throughput; decode should be the regime where the throughput win actually
+  shows up. Added as Key Takeaway #7, direct material for Phase 2 comparison.
