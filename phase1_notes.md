@@ -523,19 +523,102 @@ not required to be correct yet.
   physical array serves both matmuls because `d_head` anchors the spatial
   pair in both, just potentially transposed.
 - **Scratchpad** (Gemmini default, ≤1 MiB): holds double-buffered K/V chunks
-  (`tile_k`=1024) + P tile + Q tile + output tile ≈ 565 KB, leaving headroom.
-- **Accumulator** (Gemmini default, ≤256 KiB): holds per-head online-softmax
-  tracking state (running max + running sum + partial output accumulator,
-  fp32) for the group of 8 query heads sharing one KV head; `tile_q`=32.
+  (`tile_k`=1024, re-solved below) + a *fixed-size* P tile (`tile_q×128`,
+  not `tile_q×tile_k` — see granularity note) + Q tile + output tile.
+- **Accumulator** (Gemmini default, ≤256 KiB): holds (a) per-head
+  online-softmax tracking state (running max + running sum + partial output
+  accumulator, fp32) for the group of 8 query heads sharing one KV head —
+  `tile_q`=32, ≈130 KB across 8 heads — **plus (b) a transient raw S/P
+  block**, sized `tile_q × 128` (fine-grained — see below), ≈16 KB, not
+  multiplied by 8 heads. Found late: initially missing from the `tile_q`
+  solve entirely; the *coarse* version of this term (`tile_q × tile_k` =
+  ~128 KB) was checked and does **not** fit alongside the 8-head running
+  state (133,120 + 131,072 = 264,192 B > 262,144 B budget, over by 2 KB) —
+  this is what forced the granularity decision below, not just a stylistic
+  preference.
+- **Pipeline note / softmax granularity — resolved fine-grained:** raw S/P
+  (pre-softmax, higher precision) lives in the accumulator; only the
+  *post*-softmax, requantized-to-int8 P lives in scratchpad as the ·V
+  operand. Softmax runs **per 128-wide array sub-pass** (fine-grained), not
+  once per full `tile_k` chunk (coarse) — the coarse version was the
+  original hypothesis but was found to overflow the accumulator budget by
+  2 KB once the raw-S term was properly counted; fine-grained fits with
+  large margin (16 KB vs. 128 KB) and doesn't require inventing a new
+  precision cut, at the cost of 8× more control/softmax-touch instructions
+  per chunk (accepted tradeoff). This also converges toward the standard
+  Flash-Attention structure (one K/V block through the full QK^T→softmax→·V
+  pipeline before advancing), rather than an ad-hoc alternative. Softmax's
+  own ops (max, subtract, exp, sum, divide, rescale) are elementwise/
+  reduction, not matmul — run on a separate vector/scalar unit
+  reading/writing the accumulator, array idle throughout; whether Gemmini
+  has a native unit for this or needs the host Rocket/BOOM core is an open
+  Phase 1d question.
+- **`tile_k` re-solved under fine-grained P** (now a fixed `4,096`-byte
+  term instead of scaling with `tile_k`): `512·tile_k + 12,288 ≤ 1,048,576`
+  → `tile_k ≤ 2,024` — nearly double the old ceiling (1,912). But
+  `seq_len_k`=8192=2¹³, so only power-of-2 `tile_k` values divide it evenly
+  (avoiding a ragged final chunk); the next power of 2 above 1024 is 2048,
+  which exceeds the new 2,024 ceiling. **`tile_k`=1024 stands unchanged** —
+  not a compromise, but still the correct answer given the divisibility
+  constraint, now for a sharper reason than the original "power-of-2 feels
+  hardware-friendly" heuristic.
 - **Stated assumptions carried into 1c/1d:** (a) array/feed logic can route
   either GEMM dimension onto either physical axis between the QK^T and ·V
   phases; (b) fp32 for online-softmax tracking state (revisit at fp16 in
-  Phase 3); (c) double-buffering assumed for K/V but not for Q/output.
+  Phase 3); (c) double-buffering assumed for K/V but not for Q/output; (d)
+  **fine-grained** softmax granularity (per 128-wide array sub-pass, not per
+  `tile_k` chunk); (e) softmax executes on an as-yet-unspecified
+  vector/scalar unit, not the systolic array.
 - **Predictions to check against Timeloop:** does the mapper's near-optimal
   config land closer to 128×128 or 128×256? Does it find `tile_k`/`tile_q`
   close to the hand-derived 1024/32, or reveal a consideration missed here?
   This is the first concrete hand-vs-tool comparison point for Phase 1b,
   mirroring the fused/unfused prediction from Phase 1a.
+
+### Major open finding: K/V reuse vs. accumulator capacity (loop-order tension)
+
+Discovered by walking the full loop nest explicitly with all levels present
+(batch, KV-group, Q-tile, K/V-chunk, head, array sub-pass), not just
+reasoning about each piece in isolation:
+
+- `tile_q`=32 was solved against the accumulator budget assuming **8 heads
+  × 1 Q-tile** of simultaneous running state (`8 heads × 520·tile_q ≤
+  256 KiB` — no factor for holding multiple Q-tiles at once). The
+  accumulator physically cannot hold in-progress online-softmax state for
+  more than one Q-tile at a time.
+- This forces **Q-tile to be the outer loop relative to K/V-chunk**: you
+  must finish one Q-tile (cycling through all 8 K/V-chunks) before starting
+  the next, because the accumulator can't hold multiple Q-tiles' state
+  concurrently to let chunk stay outer instead.
+- **Consequence: this breaks the "K/V-chunk fetched once per group" GQA
+  reuse assumption.** With Q-tile outer, each K/V-chunk (evicted from the
+  ~1 MiB scratchpad to make room for the next chunk during one Q-tile's
+  sweep) has to be **re-fetched from HBM for every one of the 256 Q-tiles**,
+  not fetched once per (batch, kv-head) group as Phase 1a's compulsory-bytes
+  lower bound assumed.
+- **This is not a broken hypothesis — it's the exact category of gap Phase
+  1a's own bytes-moved section predicted**: *"this is a lower bound... real
+  mappings may re-read data if scratchpad can't hold what's needed, which is
+  a predicted source of divergence from Timeloop/Gemmini."* Finding a
+  concrete, hand-derivable instance of that predicted gap is the prediction
+  paying off, not a failure. All FLOPs work, the roofline/AI methodology,
+  ridge-point derivation, Amdahl's-Law insight, and dataflow/array-shape
+  derivation are entirely unaffected — this only concerns whether *this
+  specific* `tile_q`=32 config achieves full vs. partial K/V byte-savings.
+- **Real, unexplored design lever**: `tile_q`=32 was chosen to *maximize*
+  Q-tile size (minimizing softmax/accumulator-touch instruction count) —
+  one extreme of a tradeoff. A *smaller* `tile_q` would free accumulator
+  room to hold multiple Q-tiles' state simultaneously, directly reducing
+  K/V re-fetch frequency, at the cost of more sub-passes/instructions
+  overall. This is a genuine multi-dimensional tradeoff (tile size ×
+  re-fetch frequency × instruction count) intentionally left for Timeloop's
+  mapper to search rather than hand-optimized further, per the project's
+  own "defensible hypothesis, not optimal" framing for Phase 1b.
+- **Sharpened prediction for Phase 1c**: does Timeloop's mapper converge to
+  something like `tile_q`=32 (accepting heavy K/V re-fetching), or does it
+  find a smaller `tile_q` that trades instruction count for better reuse?
+  This is now a specific, falsifiable comparison point, not just "see what
+  the mapper finds."
 
 ---
 
@@ -588,8 +671,27 @@ not required to be correct yet.
 - [ ] Verify the array axis-routing/transpose assumption against actual
       Gemmini capability (Phase 1d)
 - [ ] Test 128×128 vs. 128×256 against Timeloop's actual sweep (Phase 1c)
+- [ ] **Softmax execution unit (Phase 1d):** softmax's elementwise/reduction
+      ops (max, subtract, exp, sum, divide, online-rescale correction) don't
+      fit the systolic array's MAC-only structure — they need a separate
+      vector/scalar functional unit reading/writing the accumulator
+      directly, with the array idle during this step. Check whether Gemmini
+      has a native unit for this or whether it has to route through the
+      host Rocket/BOOM core — the latter would be a real dispatch/data-
+      movement overhead that hand analysis and possibly even Timeloop's
+      cost model won't capture, and a prime gap-hunting target for Phase 1d.
+      Connects to the "convention for counting exp" open item from Phase 1a.
+- [ ] **K/V reuse vs. accumulator capacity (Phase 1c):** `tile_q`=32 only
+      supports 1 Q-tile's worth of simultaneous accumulator state, forcing
+      Q-tile outer to K/V-chunk in the loop nest and breaking the
+      "fetched once per group" GQA reuse assumption from Phase 1a (each
+      chunk re-fetched ~256× instead of 1×, under this specific config).
+      Intentionally left unresolved by hand — check whether Timeloop's
+      mapper finds a smaller `tile_q` that trades instruction count for
+      better reuse, or converges to the same heavy-re-fetch tradeoff.
 
-**Phase 1b: complete.** Ready for Phase 1c (Timeloop sweep).
+**Phase 1b: complete** (with one major open finding carried into 1c).
+Ready for Phase 1c (Timeloop sweep).
 
 ---
 
@@ -740,3 +842,87 @@ not required to be correct yet.
   predictions to check), a "Key Takeaways" section (7 points) for the final
   writeup, and an Open/Not-Yet-Done checklist, mirroring Phase 1a's
   structure. **Phase 1b complete — ready for Phase 1c (Timeloop sweep).**
+- Walked the full end-to-end mechanism (HBM Q/K/V → scratchpad K/V-chunk
+  fetch → per-group Q streaming → array sub-passes → accumulator →
+  scratchpad P → ·V → accumulator → HBM output) to sanity-check the whole
+  Phase 1b hypothesis coheres as one pipeline, not just as independently
+  correct pieces.
+- Caught (via that walkthrough) that "K/V stationary" is scoped to the
+  HBM↔scratchpad boundary, not a claim that the array's PE contents never
+  change — the array reloads a new 128-wide K-subtile from scratchpad every
+  sub-pass (cheap, on-chip), which doesn't contradict K/V being "stationary"
+  at the boundary that actually matters for the GQA byte-savings claim. Same
+  "stationary is scoped to a memory boundary" pattern recognized
+  independently for the third time in this project (scratchpad vs.
+  accumulator; tile_k vs. array; now HBM vs. scratchpad).
+- Identified an explicit, previously-unstated softmax-granularity choice
+  (coarse: one update per full `tile_k` chunk, matching the existing P-tile
+  scratchpad sizing; vs. fine: one update per 128-wide array sub-pass,
+  smaller P footprint but more control-overhead instructions) — logged as
+  coarse-by-choice, with the tradeoff stated rather than hidden.
+- **Found a genuinely missing accumulator term**: the raw S/P block
+  (pre-softmax QK^T output, matmul-accumulation precision) needs transient
+  accumulator residency before softmax converts+requantizes it to the int8
+  P that lives in scratchpad — distinct from the partial-output accumulator
+  term (they only coincided in size, 32×128, because the primary array
+  hypothesis is square 128×128; checked against the 128×256 alternate and
+  confirmed they're independent terms). Sized at ≈16 KB (one reused buffer,
+  not ×8 heads) — fits into the ~126 KB of existing accumulator headroom
+  without changing `tile_q`=32. Updated the Final Hypothesis section
+  accordingly.
+- Broke the array-level load/evict/reload cycle for one K-subtile down into
+  concrete steps (drain to accumulator, no writeback needed since K is
+  read-only, load next subtile from scratchpad, re-stream the same
+  resident Q-tile) — noted this cycle repeats `8 subtiles × 256 Q-tiles ×
+  8 heads` = 16,384 times per scratchpad-resident K/V chunk, all "free" in
+  HBM bytes but real array cycles and scratchpad read bandwidth for
+  Timeloop's cost model to total up.
+- Confirmed softmax touches no array cycles at all — its ops (max,
+  subtract, exp, sum, divide, rescale) are elementwise/reduction, not
+  matmul, and need a separate vector/scalar functional unit reading/writing
+  the accumulator. Flagged as an open Phase 1d question whether Gemmini has
+  a native unit for this or requires routing through the host Rocket/BOOM
+  core — real potential source of hand-analysis/Timeloop-vs-RTL divergence,
+  connects to the Phase 1a "convention for counting exp" open item.
+- Checked whether the coarse softmax granularity (assumed since it was
+  first introduced) actually fits the accumulator budget once the raw-S
+  term is counted honestly: it doesn't — 133,120 B (8-head running state) +
+  131,072 B (full `tile_q×tile_k` raw S) = 264,192 B, over the 262,144 B
+  budget by 2 KB. This is what actually settled the coarse-vs-fine tradeoff
+  flagged earlier, not just a preference — **switched the hypothesis to
+  fine-grained** softmax (per 128-wide array sub-pass), which fits with
+  large margin and avoids inventing an unanalyzed precision cut, at the
+  cost of the already-accepted 8×-more-instructions tradeoff. Also noted
+  this converges toward the real Flash-Attention algorithm's structure
+  rather than an ad-hoc alternative.
+- Re-solved `tile_k` under the now-fixed (not `tile_k`-scaling) P term:
+  ceiling nearly doubled to 2,024. But `seq_len_k`=8192=2¹³ means only
+  power-of-2 `tile_k` values divide it evenly without a ragged final chunk,
+  and the next power of 2 (2048) exceeds 2,024 — so **`tile_k`=1024 stands
+  unchanged**, now justified by an evenness/divisibility argument specific
+  to this workload's shape rather than a general hardware-friendliness
+  heuristic. Phase 1b's final hypothesis updated to reflect all of the
+  above (fine-grained softmax, corrected accumulator accounting, `tile_k`
+  re-justified).
+- Wrote out the full loop nest explicitly, all levels (batch, KV-group,
+  Q-tile, K/V-chunk, head, array sub-pass) — not just describing each piece
+  in isolation — and this surfaced a major finding: `tile_q`=32 only
+  supports one Q-tile's worth of simultaneous accumulator state (the solve
+  never had a factor for multiple Q-tiles), which forces Q-tile to be the
+  *outer* loop relative to K/V-chunk, which in turn means each K/V-chunk
+  gets re-fetched from HBM on the order of 256× (once per Q-tile) rather
+  than once per group — breaking the "fetched once per group" GQA reuse
+  assumption underlying Phase 1a's compulsory-bytes lower bound.
+- Assessed the damage honestly rather than panicking: FLOPs, roofline/AI
+  methodology, ridge point, Amdahl's-Law insight, and dataflow/array-shape
+  derivation are all unaffected. This is precisely the category of gap
+  Phase 1a's own bytes-moved section predicted in advance ("real mappings
+  may re-read data if scratchpad can't hold what's needed... a predicted
+  source of divergence from Timeloop/Gemmini") — finding a concrete
+  instance of it by hand is the prediction paying off, not wasted work.
+- Identified a real, unexplored design lever (smaller `tile_q` trading
+  instruction count for better K/V reuse) but **deliberately did not
+  hand-optimize it further** — logged as an explicit, sharpened prediction
+  for Phase 1c instead, consistent with the project's "defensible
+  hypothesis, not optimal" framing for Phase 1b. **Phase 1b complete, with
+  one major open finding carried into Phase 1c.**
