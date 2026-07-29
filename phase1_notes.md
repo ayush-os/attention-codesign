@@ -689,8 +689,26 @@ reasoning about each piece in isolation:
       Intentionally left unresolved by hand — check whether Timeloop's
       mapper finds a smaller `tile_q` that trades instruction count for
       better reuse, or converges to the same heavy-re-fetch tradeoff.
+- [ ] **Accumulator capacity as a free parameter (Phase 1c):** 256 KB is
+      Gemmini's *base/default* `acc_capacity`, not a hard ceiling. Considered
+      using TPU v1's 4 MB accumulator as justification for a bigger number,
+      rejected that comparison basis (custom datacenter ASIC vs. small RTL
+      generator — same category of mistake as the earlier TPU 8t/8i
+      comparison). **Confirmed instead via a real Gemmini paper figure**: a
+      published, benchmarked "BigSP" config exists with 512 KB scratchpad +
+      512 KB accumulator (+1 MB L2) — so 512 KB is a real, realistic
+      Phase 1c/1d target, not just plausible. That same figure's measured
+      Matmul-category speedup for BigSP was small (~1-3%) vs. Conv's
+      ~10-11%, though — don't assume bigger accumulator proportionally
+      fixes the re-fetch tension; treat as a real, sobering expectation to
+      check against, not a solved problem. Still log accumulator capacity as
+      an explicit free parameter for Timeloop's 1c sweep (128 KB base
+      through 512 KB BigSP-confirmed, possibly higher), alongside array
+      shape and `tile_k`/`tile_q`.
 
-**Phase 1b: complete** (with one major open finding carried into 1c).
+**Phase 1b: complete** (with two open findings carried into 1c: the
+K/V-reuse/accumulator-capacity tension above, and accumulator capacity
+itself as an unresolved free parameter).
 Ready for Phase 1c (Timeloop sweep).
 
 ---
@@ -924,5 +942,26 @@ Ready for Phase 1c (Timeloop sweep).
   instruction count for better K/V reuse) but **deliberately did not
   hand-optimize it further** — logged as an explicit, sharpened prediction
   for Phase 1c instead, consistent with the project's "defensible
-  hypothesis, not optimal" framing for Phase 1b. **Phase 1b complete, with
-  one major open finding carried into Phase 1c.**
+  hypothesis, not optimal" framing for Phase 1b.
+- Considered raising the accumulator size to fix the re-fetch tension,
+  citing TPU v1's real (verified) 4 MB accumulator — caught that this is
+  the wrong comparison basis (custom datacenter ASIC vs. a small RTL
+  generator, same category of error as the earlier TPU 8t/8i comparison).
+  Redirected to the actually-relevant fact instead: Gemmini's
+  `acc_capacity` is a configurable generator parameter, not a hardcoded
+  256 KB ceiling.
+- **Confirmed directly from a real Gemmini paper figure** (user-provided):
+  a published, benchmarked "BigSP" SoC config exists with **512 KB
+  scratchpad + 512 KB accumulator** (+1 MB L2), alongside a third real
+  config ("BigL2," bigger L2 instead of bigger scratchpad/accumulator) —
+  settles the "is a bigger accumulator realistic" question with a real
+  source, not just plausibility. Also surfaced a real, sobering data point
+  from that same figure: BigSP's measured speedup on the **Matmul**
+  benchmark category (closest to attention) is small (~1% single-core,
+  ~3% dual-core) versus Conv's ~11%/~10% — a caution against assuming
+  "bigger accumulator" straightforwardly fixes the re-fetch tension
+  proportionally; flagged as a real expectation-calibration point for
+  Phase 1c/1d interpretation, not just hand-waved optimism. **Phase 1b
+  complete, with two open findings carried into Phase 1c** (K/V-reuse vs.
+  `tile_q` tension; accumulator capacity as a free parameter, now backed by
+  a confirmed real config point — 512 KB — rather than left fully open).

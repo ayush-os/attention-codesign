@@ -54,6 +54,12 @@ Llama 3-70B prefill, from *How to Scale Your Model* (TPU serving chapter): batch
 
 This is not considered a broken hypothesis — Phase 1a's own bytes-moved section explicitly predicted this category of gap in advance ("real mappings may re-read data if scratchpad can't hold what's needed... a predicted source of divergence from Timeloop/Gemmini"). It was deliberately **not hand-optimized further** (a smaller `tile_q` would trade instruction count for better reuse — a real, unexplored lever) and instead left as a sharpened, falsifiable prediction for Phase 1c: does Timeloop's mapper converge to something like `tile_q`=32 (accepting heavy re-fetching), or find a smaller `tile_q` that trades instructions for reuse?
 
+### Second open finding — accumulator capacity as a free parameter (partially resolved)
+
+While discussing the finding above, considered raising the accumulator past Gemmini's 256 KB *default* to relieve the tension (bigger accumulator → bigger `tile_q` or multiple simultaneous Q-tiles → less re-fetching). Initially reached for TPU v1's real, verified 4 MB accumulator as justification — caught that this is the wrong comparison basis (TPU v1 is a full custom datacenter ASIC with a completely different area budget than a small RTL generator; same category of mistake as the earlier TPU 8t/8i comparison, which was also rejected).
+
+**Confirmed via a real Gemmini paper figure (user-provided):** a published, benchmarked "BigSP" SoC config exists with **512 KB scratchpad + 512 KB accumulator** (+1 MB L2), alongside a third real config ("BigL2," bigger L2 cache instead). So 512 KB is a real, realistic target for Phase 1c/1d, not just a plausible guess. But that same figure showed BigSP's measured speedup on the Matmul benchmark category (closest to attention) was small (~1-3%) versus Conv's (~10-11%) — a real reason not to assume "bigger accumulator" proportionally fixes the re-fetch tension. Still log accumulator capacity as an explicit free parameter for Timeloop's 1c sweep (128 KB base through the confirmed 512 KB BigSP point, possibly higher), alongside array shape and `tile_k`/`tile_q` — the exact optimum is still for Timeloop to find, but the search range is now grounded in a real config rather than speculative.
+
 ---
 
 ## Immediate next step: Phase 1c tooling setup
@@ -61,7 +67,7 @@ This is not considered a broken hypothesis — Phase 1a's own bytes-moved sectio
 Phase 0 tooling (Timeloop/Accelergy via Docker, Gemmini/Chipyard via Verilator) is assumed done — confirm with the user if picking this up fresh. For Phase 1c specifically, four artifacts are needed (this part is 🔧, fine to help build directly):
 
 1. **Workload/problem spec** (Timeloop YAML) — separate specs for QK^T (M=`seq_len_q`, N=`seq_len_k`, K=`d_head`) and ·V (M=`seq_len_q`, N=`d_head`, K=`seq_len_k`), with batch/`num_q_heads`/`num_k_heads` as outer loop bounds.
-2. **Architecture spec** — PE array as a *parameterized* search space (so Timeloop can sweep 128×128 vs. 128×256 and others, not locked to the hand hypothesis), scratchpad and accumulator as separate memory levels with parameterized capacity (sweep around the ~1 MiB / 256 KiB hand estimates), HBM level with TPU v5e bandwidth/capacity from the Phase 1a ridge-point work.
+2. **Architecture spec** — PE array as a *parameterized* search space (so Timeloop can sweep 128×128 vs. 128×256 and others, not locked to the hand hypothesis), scratchpad and accumulator as separate memory levels with parameterized capacity (sweep around the ~1 MiB / 256 KiB hand estimates, and let the accumulator sweep range extend past 256 KB per the second open finding above — don't hardcode it), HBM level with TPU v5e bandwidth/capacity from the Phase 1a ridge-point work.
 3. **Accelergy energy/area models** for each component (PE, scratchpad, accumulator, DRAM interface).
 4. **Mapper/constraint config** — dataflow permutations unconstrained (see if the mapper *independently* finds K/V-stationary), tiling factor ranges for `tile_q`/`tile_k`, legal loop orderings.
 
