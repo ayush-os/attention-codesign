@@ -37,7 +37,7 @@ Llama 3-70B prefill, from *How to Scale Your Model* (TPU serving chapter): batch
 - Ridge point: ≈480.5 FLOPs/byte (TPU v5e int8, same source as workload)
 - Conclusion: fused → decisively compute-bound; unfused → decisively memory-bound. Regime is determined by the fusion (P-matrix on-chip) decision, not workload shape alone.
 - GQA's benefit is regime-dependent in two distinct ways: (1) Amdahl's-Law style — its 8× K/V byte win barely shows up in the unfused case (P-traffic dominates) but shows up fully in fused; (2) roofline-position style — in fused/compute-bound prefill, GQA's bytes savings don't move execution time at all (time is set by FLOPs, unchanged by GQA); its real prefill payoff is scratchpad pressure and KV-cache footprint, not throughput. The throughput win is expected in memory-bound decode (Phase 2).
-- Full "Key Takeaways" section (7 points) logged in `phase1_notes.md` for the final writeup.
+- Full "Key Takeaways" section logged in `phase1_notes.md` for the final writeup — see the Phase 1b takeaways section (17 points) for the fuller, more recent set, since several of Phase 1a's original 7 got extended/superseded by later findings.
 
 ## Phase 1b final hypothesis (full derivation and "Major open finding" section in `phase1_notes.md`)
 
