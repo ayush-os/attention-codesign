@@ -658,6 +658,75 @@ reasoning about each piece in isolation:
    unfused bytes-moved) and roofline-position-style (fused prefill's
    compute-bound time isn't helped by GQA at all — its real payoff there is
    scratchpad pressure and KV-cache footprint, not throughput).
+8. **"Stationary" is always scoped to a specific memory boundary, and this
+   pattern recurs recursively.** Recognized independently three times:
+   scratchpad-vs-accumulator, array-vs-scratchpad (`tile_k` sub-passes),
+   and HBM-vs-scratchpad (K/V "stationary" means HBM isn't re-touched per
+   head, not that the array's PE contents are frozen). Whenever something
+   is called "resident," the next question is always *relative to which
+   boundary*.
+9. **Raw matmul output and post-processing output are different objects,
+   even when they coincidentally match in size.** The pre-softmax S block
+   (accumulator) and the post-softmax, requantized P (scratchpad) looked
+   identical (`32×128` each) purely because the primary array hypothesis is
+   square — checking against the 128×256 alternate is what proved they're
+   independent terms, exposing a genuinely missing accumulator line item.
+10. **A choice made for one reason can silently violate a different,
+    unrelated constraint.** Coarse softmax granularity was chosen to
+    minimize control instructions — but once the raw-S term was counted
+    honestly, coarse didn't fit the accumulator budget at all (over by
+    2 KB). The forced fix (fine-grained) also happened to converge toward
+    how real Flash Attention actually works.
+11. **Workload shape can make a "hardware-friendliness heuristic" into a
+    hard requirement.** `seq_len_k`=8192=2¹³ means only power-of-2 tile
+    sizes divide it evenly (avoiding a ragged final tile) — so `tile_k`
+    staying at 1024 even after its ceiling nearly doubled wasn't a style
+    choice, it was the only valid answer given the workload's own shape.
+12. **Major finding: capturing GQA's cross-head reuse and having enough
+    per-head Q-tile capacity are in direct tension under a small, fixed
+    accumulator.** Sweeping 8 heads together against one resident K/V chunk
+    (the mechanism behind GQA's HBM savings) requires holding 8 heads'
+    state simultaneously, which leaves room for only one Q-tile at a time,
+    which forces the *opposite* problem: re-fetching each K/V chunk ~256×
+    instead of once. The mechanism that lets you exploit the reuse is what
+    starves the capacity needed to avoid re-fetching. Not a sign GQA
+    "doesn't work" (the computation is unaffected) — a sign this specific
+    config likely doesn't realize the full theoretical 8× byte-savings.
+    This is exactly the category of gap Phase 1a's own bytes-moved section
+    predicted in advance ("real mappings may re-read data if scratchpad
+    can't hold what's needed") — finding a concrete instance of it by hand
+    is the prediction paying off, not a setback.
+13. **When you hit a wall like #12, check whether it's fundamental or an
+    artifact of one specific choice.** Here it's the latter: a smaller
+    `tile_q` trades more control instructions for holding multiple Q-tiles
+    simultaneously, directly reducing re-fetch frequency — a real,
+    unexplored lever, deliberately left unresolved as a sharpened
+    prediction for Timeloop rather than hand-optimized further.
+14. **Cross-chip comparisons need to match constraint regime, not just be
+    factually real.** TPU v1's 4 MB accumulator is verified-real, but
+    citing it to justify a Gemmini config is the wrong comparison basis
+    (custom datacenter ASIC vs. small RTL generator) — the same category of
+    mistake as reaching for TPU 8t/8i's SRAM earlier. A true fact can still
+    be an invalid argument if the underlying chips aren't comparable.
+15. **The right resolution was checking the actual target tool's own
+    documented flexibility, not reaching for an unrelated chip.** Gemmini's
+    `acc_capacity` is a real, user-configurable generator parameter, and a
+    real, published, *benchmarked* config (BigSP: 512 KB scratchpad + 512 KB
+    accumulator) confirmed it's realistic — turning speculation into a
+    grounded search-range endpoint for Phase 1c.
+16. **Real data can be calibrating, not just confirming.** BigSP's measured
+    speedup on Matmul-category workloads was small (~1-3%) versus Conv's
+    (~10-11%) — a genuine caution against assuming "bigger accumulator"
+    proportionally fixes the re-fetch tension from #12. Worth carrying into
+    how Phase 1c's actual results get interpreted.
+17. **How Phase 1b and 1c actually divide labor.** 1b's job was producing
+    specific, justified predictions wherever hand-derivation could reach
+    one (dataflow, `d_head` as an axis, `tile_k`=1024, `tile_q`=32) — and
+    explicitly flagging, not forcing, the places it couldn't (array's
+    second axis, accumulator capacity, the reuse/capacity tension). 1c
+    isn't limited to picking from a hand-curated shortlist; it's a genuine
+    search, with the hand-derived numbers serving as falsifiable comparison
+    points, not constraints on what the tool is allowed to find.
 
 ---
 
@@ -965,3 +1034,13 @@ Ready for Phase 1c (Timeloop sweep).
   complete, with two open findings carried into Phase 1c** (K/V-reuse vs.
   `tile_q` tension; accumulator capacity as a free parameter, now backed by
   a confirmed real config point — 512 KB — rather than left fully open).
+- Extended the "Key Takeaways (Phase 1b)" section from 7 to 17 points,
+  covering everything found since the first takeaways pass: the recurring
+  "stationary is boundary-scoped" pattern, the raw-S-vs-partial-output
+  distinction, the coarse-softmax-accumulator-overflow discovery, the
+  seq_len_k divisibility argument, the major K/V-reuse-vs-accumulator
+  finding and the deliberate choice not to hand-optimize past it, the two
+  TPU-comparison-basis corrections (v1 and 8t/8i), the BigSP confirmation
+  and its calibrating Matmul-vs-Conv data point, and the Phase 1b/1c
+  division-of-labor framing. **`phase1_notes.md` and `handoff.md` both
+  fully up to date — Phase 1b genuinely complete, ready to start Phase 1c.**
