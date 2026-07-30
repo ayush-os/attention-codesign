@@ -239,9 +239,133 @@ which were modeled.
   rather than dropped-token traffic reduction. Worth confirming this
   framing before building the 1c imbalance model.
 
+---
+
+## Phase 1b: Communication volume — uniform routing (ideal case)
+
+### Scope decisions (resolved during derivation)
+
+- **Regime: decode-step, not prefill.** This whole derivation is per single
+  autoregressive decode step — each forward pass through a layer processes
+  exactly **one new token per active sequence**, regardless of that
+  sequence's context length. seq_len=8192 governs KV-cache sizing (already
+  used in Phase 1a's batch derivation) but does **not** multiply into
+  per-step token count here — that's exactly what Phase 1a's note ("seq_len
+  is not a first-order lever for MoE comms volume") meant. A prefill-regime
+  version of this derivation (tokens = sequences × seq_len) is a distinct,
+  not-yet-done extension, flagged for later if wanted.
+- **Dispatch/combine precision: FP4, uniform** — kept consistent with the
+  Phase 1a simplifying assumption. Flagged caveat (not yet resolved,
+  low-priority): real EP systems may prefer higher precision than compute
+  for cross-device hops specifically, since each independent
+  quantize→dequantize round trip at a network boundary introduces its own
+  rounding error, vs. a local matmul's single quantize-then-accumulate
+  in fp32. Worth revisiting only if a future numbers come out close to the
+  ridge point.
+- **FLOPs-side scope: all 8 experts/token** (2 shared + 6 routed), not just
+  the 6 routed ones — decided because the compute-to-comms ratio's purpose
+  is a device-level bottleneck question (does a device's compute engine or
+  its network port gate execution time — the spec's `time = max(compute,
+  communication)` framing), and shared-expert compute occupies the same
+  physical compute engine even though it generates zero dispatch traffic.
+  ("Is routing worth it" — routed-only FLOPs vs. comms — is a different,
+  narrower question not used here.)
+
+### Per-token dispatch fan-out (device-limited routing)
+
+Verified against the primary source (arXiv 2405.04434v5, §2.2.2, not just
+trusted from memory): *"for each token, we first select M devices that have
+experts with the highest affinity scores in them. Then, we perform top-K
+selection among experts on these M devices."* This is **structural, not
+coincidental** — a token's 6 routed experts are guaranteed by construction
+to live on at most 3 devices, every time (device selection happens before
+expert selection, and expert selection is restricted to fall within the
+selected devices). Paper also notes M≥3 is empirically equivalent to
+unrestricted global top-K (no quality loss at this cap).
+
+Home-device overlap: a token's home device (assigned by batch-sharding at
+the serving layer, unrelated to the router's affinity scores, which are a
+function of token content) may itself be one of the 3 selected devices, in
+which case that portion of dispatch is local/free — same reason shared
+experts generate no dispatch traffic. Since **1b is the uniform/ideal
+control case** (worst-case reasoning belongs in 1c's imbalance model, per
+the spec's own phase split), used **expected value**, not worst case:
+
+- P(home ∈ top-3) = 3/8 → 2 remote hops
+- P(home ∉ top-3) = 5/8 → 3 remote hops
+- **E[remote devices/token] = (3/8)(2) + (5/8)(3) = 2.625**
+
+### Combine mirrors dispatch
+
+If multiple of a token's 6 routed experts land on the same device, that
+device sums their weighted outputs locally and sends back **one** combined
+result, not one per expert — same "pay per unique remote device" logic as
+dispatch. Payload size is also identical to dispatch: the expert FFN's
+down-projection (d_ff=1536 → d_model=5120) happens **locally**, before
+anything crosses the network, so the combine payload is d_model-sized, same
+as the dispatch payload — the down-projection is invisible to the comms
+derivation.
+
+### Bytes moved
+
+- Payload/token = d_model × precision bytes = 5,120 × 0.5 (FP4) = **2,560
+  bytes**
+- Per-token-per-layer = payload × 2 (dispatch + combine) × E[remote
+  devices] = 2,560 × 2 × 2.625 = **13,440 bytes**
+- Token population (system-wide, one decode step): 1,024 sequences/device ×
+  8 devices = **8,192 tokens** (the "×8 devices" is already baked into
+  8,192 — do not multiply by 8 again)
+- **Total comms/layer = 13,440 × 8,192 = 110,100,480 bytes = exactly 105
+  MiB** (dispatch + combine, whole system, one decode step)
+
+### FLOPs moved
+
+- Per-token-per-expert (SwiGLU: gate + up, each d_model→d_ff; down,
+  d_ff→d_model; standard 2×M×N×K GEMM count, M=1): 3 × 2 × d_model × d_ff =
+  3 × 2 × 5,120 × 1,536 = **47,185,920 FLOPs**
+- × 8 experts/token (2 shared + 6 routed) = **377,487,360 FLOPs/token**
+- × 8,192 tokens = **3,092,376,453,120 FLOPs ≈ 3.09 TFLOPs/layer** (whole
+  system, one decode step — same scope as the comms figure, required for a
+  valid ratio)
+
+### Ridge point and verdict
+
+TPU 8i ICI bandwidth (19.2 Tb/s) verified independently — Google's own
+primary blog post doesn't state the ICI number explicitly, but multiple
+secondary sources corroborate it (e.g. "2.4 TB/s (19.2 Tb/s), roughly double
+Ironwood [TPU v7]'s 1.2 TB/s"). Note the units: 19.2 **Tb/s** (bits) ÷ 8 =
+**2.4 TB/s** (bytes) — comparing the raw 19.2 number directly against HBM's
+8.6 TB/s without converting units makes ICI look faster than HBM, which
+would be physically backwards; converted correctly, ICI (2.4 TB/s) is
+well below HBM (8.6 TB/s), as expected.
+
+- Ridge point = FLOPS ÷ ICI bandwidth = 10.1×10¹⁵ ÷ 2.4×10¹² ≈ **4,208
+  FLOPs/byte**
+- Workload arithmetic intensity = 3,092,376,453,120 ÷ 110,100,480 ≈
+  **28,087 FLOPs/byte**
+- **≈6.7× above the ridge point → decisively compute-bound**, in the
+  ideal/uniform routing case.
+
+**Caveat carried into 1c:** this compute-bound headroom is a system-wide,
+ideal-case average. It does not guarantee the workload stays compute-bound
+once real routing imbalance is introduced — a locally comms-bound moment
+(one overloaded device) can exist even while the global average looks
+compute-bound. That's the load-bearing reason the spec keeps 1b and 1c as
+separate deliverables rather than one number.
+
+---
+
 ## Next step
 
-Phase 1b: derive dispatch + combine communication volume under the
-uniform-routing (perfect load balance) control case, using the shape above
-— accounting for the M≤3 device-cap nuance rather than the spec's naive
-per-expert formula.
+Phase 1b complete. Two outstanding items, per `moe_handoff.md`:
+
+1. **Phase 0** (still not executed): build ASTRA-sim locally via Docker.
+   Boilerplate/tooling, not blocking further hand-derivation, but needed
+   before Phase 3 (simulation) can happen.
+2. **Phase 1c** (next real 🧠 work): derive comms volume under load
+   imbalance — research a realistic imbalance model from the actual MoE
+   literature (capacity factor, the paper's α1/α2/α3 balance-loss
+   coefficients — which one grounds the right model is still unresolved —
+   and whether token-dropping, stated as training-only in the paper, is
+   even a valid assumption to import into this inference-focused analysis).
+   Flagged as the phase most likely to balloon in scope — pace carefully.
