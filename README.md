@@ -44,7 +44,7 @@ Full derivation trail (every hypothesis, correction, and dead end): [`attention/
 
 ---
 
-## MoE Routing System Codesign → [`moe-routing/`](moe-routing/)
+## MoE Routing System Codesign → [`moe-routing-notes.md`](moe-routing-notes.md)
 
 **Stack:** ASTRA-sim (setup pending) · **Workload:** DeepSeek-V2 MoE (236B total / 21B activated) — 160 routed + 2 shared experts, top_k=6 capped at M≤3 devices, MLA attention, 8-way expert-parallel deployment on TPU 8i (FP4, Boardfly interconnect)
 
@@ -58,14 +58,13 @@ Extends the same loop one level up the stack: from single-accelerator microarchi
 
 | Phase | Focus | Status |
 |---|---|---|
-| 1a | Workload shape: DeepSeek-V2, MLA, device-limited routing | ✅ done |
-| 1b | Communication volume, uniform routing (ideal case) | ✅ done |
-| 1c | Communication volume under load imbalance | ✅ done |
-| 2 | System architecture hypothesis: topology, bandwidth, buffering | ⏳ next |
-| 3 | Validate the hypothesis in ASTRA-sim | ⏳ not started |
-| 4 | Synthesis: on-chip SRAM (attention) vs. interconnect (MoE) budget tradeoff | ⏳ not started |
+| 1a–1c | Workload shape, uniform + imbalanced communication volume | ✅ done |
+| 2 | System architecture hypothesis: topology, bandwidth, buffering | ✅ done |
+| 3 | Validate the hypothesis in ASTRA-sim | ✅ done — topology confirmed; bandwidth/buffering found untestable in the analytical backend (a real tool-ceiling finding, not a gap in the reasoning) |
+| 4 | Synthesis: on-chip SRAM (attention) vs. interconnect (MoE) budget tradeoff | ✅ done |
 
-Full derivation trail: [`moe-routing/notes.md`](moe-routing/notes.md).
+Full writeup (workload, hypothesis, ASTRA-sim results, cross-project
+synthesis, key takeaways): [`moe-routing-notes.md`](moe-routing-notes.md).
 
 ---
 
