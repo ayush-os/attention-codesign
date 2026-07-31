@@ -2,7 +2,7 @@
 
 **Purpose:** this doc exists so a new chat session can pick up this project exactly where the last one left off, without needing to re-read the full `notes.md` history first. Read this doc first; use `notes.md` as the detailed reference/derivation trail when you need it.
 
-**Status as of this handoff:** Phase 1a complete, Phase 1b complete (with one major open finding). Phase 1c not started — that's the next step.
+**Status as of this handoff:** Phase 1a complete, Phase 1b complete. Phase 1c was run end-to-end in a separate session that got destroyed (repo rename killed the Claude Code chat mid-flight) — but the Timeloop artifacts and Docker container survived, and were fully recovered and logged in `notes.md` under "Phase 1c: Timeloop Sweep — Recovered State." Two long-running mapper jobs (`_v3`, over 2 days of runtime) found during recovery were killed after confirming they'd already hit the theoretical utilization ceiling. **Next step: compare the recovered Phase 1c results against the Phase 1b hypothesis and explain the two open findings logged in notes.md** — that comparison has not been done yet.
 
 ---
 
@@ -62,21 +62,23 @@ While discussing the finding above, considered raising the accumulator past Gemm
 
 ---
 
-## Immediate next step: Phase 1c tooling setup
+## Immediate next step: Phase 1c interpretation (tooling/runs are done)
 
-Phase 0 tooling (Timeloop/Accelergy via Docker, Gemmini/Chipyard via Verilator) is assumed done — confirm with the user if picking this up fresh. For Phase 1c specifically, four artifacts are needed (this part is 🔧, fine to help build directly):
+Phase 1c tooling and runs are **complete** — see `notes.md`'s "Phase 1c: Timeloop Sweep — Recovered State" section for the full artifact inventory, results table, and raw winning mappings for QK^T and ·V. What's left is the actual 🧠 comparison-and-gap-explanation step the spec calls for, not further tool setup:
 
-1. **Workload/problem spec** (Timeloop YAML) — separate specs for QK^T (M=`seq_len_q`, N=`seq_len_k`, K=`d_head`) and ·V (M=`seq_len_q`, N=`d_head`, K=`seq_len_k`), with batch/`num_q_heads`/`num_k_heads` as outer loop bounds.
-2. **Architecture spec** — PE array as a *parameterized* search space (so Timeloop can sweep 128×128 vs. 128×256 and others, not locked to the hand hypothesis), scratchpad and accumulator as separate memory levels with parameterized capacity (sweep around the ~1 MiB / 256 KiB hand estimates, and let the accumulator sweep range extend past 256 KB per the second open finding above — don't hardcode it), HBM level with TPU v5e bandwidth/capacity from the Phase 1a ridge-point work.
-3. **Accelergy energy/area models** for each component (PE, scratchpad, accumulator, DRAM interface).
-4. **Mapper/constraint config** — dataflow permutations unconstrained (see if the mapper *independently* finds K/V-stationary), tiling factor ranges for `tile_q`/`tile_k`, legal loop orderings.
+1. Compare the recovered Timeloop results against the Phase 1b hand hypothesis point by point — array shape, dataflow (was K/V actually found stationary?), scratchpad/accumulator sizing.
+2. Resolve the two open findings logged in `notes.md` (flagged, not explained yet):
+   - QK^T's winning map keeps nothing resident in scratchpad at all (no K/V-stationary reuse found), yet still hits the ideal 100%-utilization compute-bound cycle count despite the modeled DRAM traffic including the full unfused 128 GiB P-write — is Phase 1a's TPU-v5e-derived ridge point (≈480.5) even the right comparison for an architecture that only models a single 128×128 array, or does this architecture have its own, different ridge point?
+   - ·V's winning dataflow differed qualitatively between the two completed runs (output-stationary @ 100% util vs. weight-stationary @ 80.63% util) even though only the clock/bandwidth modeling was changed between them, not the architecture — mapper search variance, or a real effect of the bandwidth fix?
+3. If a complete `_v3` (larger search budget) record is wanted for the writeup, rerun bounded (e.g. `search_size=375000`) rather than open-ended — the previous `_v3` attempt ran for 2+ days and was killed after confirming it wasn't going to find a different answer (see notes.md for why).
 
-Goal for 1c: find Timeloop's near-optimal config and compare against the Phase 1b hypothesis above — where do they agree, where do they diverge, and (per the spec) explaining the mismatch is the important part, not just noting it.
+Per the project's own framing, explaining these mismatches mechanistically is the highest-value part of Phase 1c/1d — don't just note that they diverge.
 
 ---
 
 ## Where everything else lives
 
 - `spec.md` — original project spec, all phases.
-- `notes.md` — full derivation trail for Phase 1a and 1b, in Prediction/Log style. This is the artifact to keep appending to.
-- This file (`handoff.md`) — update/overwrite at the next natural pause point (e.g., end of Phase 1c) rather than leaving stale.
+- `notes.md` — full derivation trail for Phase 1a, 1b, and the recovered Phase 1c results, in Prediction/Log style. This is the artifact to keep appending to.
+- `timeloop-accelergy-exercises/workspace/attention_1c/` (separate repo/docker environment, not this one) — the actual Timeloop configs and run outputs referenced above.
+- This file (`handoff.md`) — update/overwrite at the next natural pause point rather than leaving stale.
