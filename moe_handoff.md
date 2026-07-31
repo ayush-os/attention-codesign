@@ -5,10 +5,10 @@ new session — it's the short "where things stand" pointer. Full derivation
 trail, sourced numbers, and the reasoning behind every choice lives in
 `moe_phase1_notes.md`; don't re-derive anything already logged there.
 
-**Status as of this handoff:** Phase 1a (workload shape) and Phase 1b
-(uniform-routing comms volume + compute-to-comms ratio) complete. Phase 0
-(ASTRA-sim setup) decided but **not yet executed**. Phase 1c (load-imbalance
-modeling) not started — that's the next real work.
+**Status as of this handoff:** Phase 1 fully complete — 1a (workload shape),
+1b (uniform-routing comms volume), and 1c (load-imbalance modeling) all
+done. Phase 0 (ASTRA-sim setup) decided but **still not yet executed**.
+Phase 2 (system architecture hypothesis) is the next real work.
 
 ---
 
@@ -60,6 +60,33 @@ per forward pass), so seq_len does not multiply into per-step token count.
 A prefill-regime version (tokens = sequences × seq_len) would be a distinct,
 not-yet-done extension if ever wanted later.
 
+## Phase 1c result (complete — full derivation in `moe_phase1_notes.md`)
+
+**Headline: this workload is robust to realistic load imbalance on TPU 8i
+at FP4 — every scenario stays decisively compute-bound.** Imbalance
+magnitude grounded in two real, cited sources (Gini≈0.70 across
+DeepSeek-V3/Qwen3-MoE/Mixtral; 70% GPU stall time on real Mixtral-8×7B
+serving → implies a 3.3× device-load multiplier). Key structural finding:
+splitting per-device FLOPs into a fixed shared-expert component (driven by
+home tokens, doesn't scale with routing popularity) and a scaling
+routed-expert component (does scale) reveals a **hard, imbalance-proof
+floor of ≈21,065 FLOPs/byte** — no imbalance severity, however extreme, can
+push this below the ≈4,208 ridge point. The three-point range (uniform /
+CF=1.0 dropping-on / uncapped dropping-off) all land compute-bound, ~5-6.7×
+margin throughout.
+
+**The one lever that actually matters: dispatch precision, not imbalance.**
+The floor scales inversely with payload precision — FP4 gives ~5× margin,
+BF16 only ~1.25× (thin), and the exact crossover to comms-bound is
+**≈2.5 bytes/element**. If this workload ever tips comms-bound, it'll be
+from a numerics decision, not routing skew.
+
+Also worth knowing if picking this back up: an earlier logged assumption
+("token-dropping is training-only") was **wrong** and got corrected
+mid-session — the paper actually allows optional inference-time dropping at
+CF=1.0 exactly, device-level, lowest-affinity-first. Don't re-assert the old
+framing.
+
 ## Two outstanding items — do the first before deep-diving the second
 
 ### 1. Phase 0: ASTRA-sim isn't built yet
@@ -73,17 +100,16 @@ not the default venue. **This hasn't been attempted yet — confirm with the
 user whether it's been done outside this chat before assuming it's still
 pending.**
 
-### 2. Phase 1c: derive comms volume under load imbalance (the real case)
+### 2. Phase 2: predict the ideal system architecture
 
-This is the next real 🧠 work now that 1b's uniform control case is done.
-Open items flagged but not yet resolved: the three balance-loss coefficients
-(α1/α2/α3 — expert/device/communication-level, not yet researched which is
-the right lever) and that token-dropping is training-only per the paper
-(likely rules it out as an imbalance-mitigation assumption for this
-inference-focused analysis). Full detail in `moe_phase1_notes.md`'s "Open
-items" section — don't re-derive, just pick up from there. **Watch
-calibration here** (see below) — this phase is explicitly flagged in the
-spec as the one most likely to balloon in scope.
+This is the next real 🧠 work now that all of Phase 1 (uniform + imbalanced
+comms volume) is done. Per the spec: topology, bandwidth allocation, and
+buffering/SRAM sizing, informed by Phase 1's findings. One instinct flagged
+in `moe_phase1_notes.md` worth testing rather than assuming: since imbalance
+turned out to barely move the needle (headroom only eroded from 6.7× to
+~5×), exotic imbalance-driven topology/bandwidth choices (e.g. extra
+capacity earmarked for popular-expert links) may matter less than they
+would have going into this phase without that result in hand.
 
 ---
 
