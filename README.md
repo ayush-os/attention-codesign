@@ -23,6 +23,7 @@ Every phase follows the same loop: **hand-derive a prediction → validate again
 - Proved the compute/memory-bound regime is a **design decision, not a workload property** (see above) — a 65× AI swing from fusion alone, at a fixed ridge point.
 - Showed GQA's 8× KV-cache reduction is **not** an 8× bandwidth win: total compulsory bytes only drop **1.78×** (Amdahl's Law — Q/output activity floors the total), and in the fused/compute-bound regime GQA doesn't reduce execution time *at all*, since time is set by FLOPs, which GQA leaves untouched.
 - Derived a full hardware hypothesis from first principles (**128×128** systolic array, K/V-stationary weight-stationary dataflow, `tile_k=1024`, `tile_q=32`) and, stress-testing it by hand, found the `tile_q=32` re-fetch tension above — a sharpened, falsifiable prediction for the Timeloop sweep, not a fixed conclusion.
+- Swept the hypothesis in Timeloop and found the ridge point itself doesn't transfer across chips: a small single-array model has **6× lower peak compute** than TPU v5e at the same real HBM bandwidth, so its ridge point is **≈80, not 480.5** — flipping what "unfused" predicts for *this* hardware specifically. Also caught the mapper tool's own blind spot: its search is deterministic (confirmed via a byte-for-byte-identical rerun), so a discovered "optimum" can just be a local one a shallow search never escaped — and the tool's problem format can't represent kernel fusion at all, a real scope limit now deferred to RTL rather than hidden.
 
 **Roofline — MHA vs. GQA** (batch=32, seq_len=8192, int8):
 
@@ -35,8 +36,8 @@ Every phase follows the same loop: **hand-derive a prediction → validate again
 |---|---|---|
 | 1a | Roofline: FLOPs, bytes, AI, ridge point | ✅ done |
 | 1b | Hardware hypothesis: PE array, dataflow, scratchpad/accumulator | ✅ done |
-| 1c | Sweep the same design space in Timeloop, compare to 1b | ⏳ next |
-| 1d | Configure Gemmini, read generated RTL, validate in Verilator | ⏳ not started |
+| 1c | Sweep the same design space in Timeloop, compare to 1b | ✅ done |
+| 1d | Configure Gemmini, read generated RTL, validate in Verilator | ⏳ next |
 | 2 | Repeat 1a→1d for the decode regime (memory-bound by construction) | ⏳ not started |
 
 Full derivation trail (every hypothesis, correction, and dead end): [`attention/notes.md`](attention/notes.md).
