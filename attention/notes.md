@@ -1121,28 +1121,190 @@ later for the writeup, rerun with a bounded `search_size` (e.g. 375,000,
 matching what thread 0 already completed in the killed runs) so it
 terminates in a normal window instead of open-ended.
 
-### Open findings carried forward (NOT resolved — flagged for Phase 1c/1d interpretation)
+### Open findings carried forward (Phase 1c/1d interpretation)
 
-1. **QK^T's winning mapping keeps nothing resident in scratchpad at all**
-   (no K/V-stationary reuse), directly contradicting the Phase 1b hypothesis
-   that K/V should be scratchpad-resident — yet still achieves the ideal
-   100%-utilization compute-bound cycle count, even though the modeled DRAM
-   traffic includes the full *unfused* 128 GiB P-write (which Phase 1a
-   predicted should be decisively memory-bound, at AI≈126 vs. a ridge point
-   of ≈480.5). Worth checking: is 480.5 (derived from full TPU v5e, 4 MXUs)
-   even the right ridge point to compare against here, given this Timeloop
-   architecture models a single 128×128 array, not a full TPU v5e chip? The
-   architecture's *own* peak-compute/peak-bandwidth ratio may differ
-   substantially from the TPU v5e number carried over from Phase 1a.
-2. **·V's winning dataflow was qualitatively different between v1 and v2**
-   (output-stationary @ 100% util vs. weight-stationary @ 80.63% util) even
-   though the only thing that changed between those two runs was the
-   clock-rate/DRAM-bandwidth modeling correction, not the architecture or
-   hypothesis being tested. Whether this is mapper search variance (the
-   `random_pruned` mapper simply landing in a different local optimum) or a
-   real consequence of the bandwidth-model fix is unresolved.
+1. **RESOLVED — QK^T hits 100% utilization despite the full unfused 128 GiB
+   P-write, because the ridge point that matters here isn't Phase 1a's
+   480.5.** Phase 1a's ridge point (480.5 FLOPs/byte) was derived from TPU
+   v5e's real peak compute (4 MXUs × 128×128 × 1.5 GHz × 2× int8 =
+   3.94e14 FLOPs/s) over its real HBM bandwidth. This Timeloop architecture
+   models a **single** 128×128 array — not TPU v5e's 4 MXUs — at a 1 GHz
+   base clock, not TPU v5e's real 1.5 GHz base clock, while DRAM bandwidth
+   is held fixed at the real TPU v5e value throughout. Two independent
+   factors, both lowering this architecture's own peak compute relative to
+   TPU v5e: **4× from the array count, 1.5× from the base-clock mismatch**,
+   for a combined **6×** lower peak compute at the same memory bandwidth →
+   this architecture's own ridge point is 480.5 / 6 ≈ **80.08 FLOPs/byte**,
+   not 480.5. Unfused AI≈126 is *below* Phase 1a's TPU v5e ridge (480.5) but
+   *above* this architecture's own ridge (80.08) — so the correct prediction
+   for this specific modeled system was compute-bound all along, exactly
+   matching the observed 100% utilization / 2^30-cycle result. Not a mapper
+   surprise, not a Phase 1b hypothesis failure — a reminder that the ridge
+   point is a property of the *specific accelerator being modeled*, not a
+   fixed workload characteristic carried over from whatever reference chip
+   Phase 1a happened to use. **General lesson for the writeup**: any time a
+   Phase 1a/1b roofline conclusion is checked against a Phase 1c/1d tool
+   result, the ridge point has to be recomputed for the actual modeled
+   hardware, not reused wholesale from the original workload-source chip —
+   this generalizes the same "regime is a design decision, not a fixed
+   workload property" theme from Phase 1a's Key Takeaway #1, extended one
+   level further: regime is also relative to *which hardware* you're
+   asking about.
+2. **Still open — ·V's winning dataflow was qualitatively different between
+   v1 and v2** (output-stationary @ 100% util vs. weight-stationary @
+   80.63% util) even though the only thing that changed between those two
+   runs was the clock-rate/DRAM-bandwidth modeling correction, not the
+   architecture or hypothesis being tested.
 
-**Phase 1c status: substantial real Timeloop data recovered and logged: not
-yet compared point-by-point against the Phase 1b hypothesis, and the two
-open findings above are not yet explained. That comparison/explanation is
-the next real step.**
+   **RESOLVED (mechanistically), via direct comparison of the identical
+   mapping across v1/v2 rather than the two missing counterfactual runs
+   (weight-stationary forced in v1, output-stationary forced in v2) —
+   turned out not to be needed.** The exact same loop-nest mapping was
+   independently sampled in both runs' raw search logs:
+
+   ```
+   v1 (1 GHz):  L4[WIO] C2 G128 N1024 - L3[W] C32 G2 N32 - ...   Util=1.00, Cycles=1,073,741,824
+   v2 (2 GHz):  L4[WIO] C2 G128 N1024 - L3[W] C32 G2 N32 - ...   Util=0.81, Cycles=1,331,701,751
+   ```
+
+   Identical mapping, worse cycle count under v2 — a **real, mapping-invariant
+   effect**, not search noise: this schedule's DMA time fully hid behind
+   compute under v1's clock model and stopped fully hiding once compute got
+   2× faster against the same fixed DRAM bandwidth (the same ridge-doubling
+   from finding #1, now shown to have a second, distinct consequence: it
+   doesn't just reclassify compute-vs-memory-bound, it can break a
+   specific mapping's DMA/compute overlap outright).
+
+   Second half of the explanation: in v1's own log, weight-stationary and
+   output-stationary were essentially **tied** at 100% utilization
+   (pJ/Compute 2.821 vs. 2.820, with a third output-stationary sample at
+   2.810 edging out as the reported winner by under 0.5%) — so in v1,
+   dataflow choice barely mattered; either one reaches the ideal. In v2's
+   own default-budget log (50,000 valid mappings, same budget as v1 used),
+   the best output-stationary sample found only reached **50% utilization**
+   (Cycles=2,147,483,648) — nowhere near competitive with weight-stationary's
+   80.63%. So weight-stationary "won" v2's race not because it was good, but
+   because v2's search never happened to sample a competitive alternative —
+   even though one demonstrably exists under v2's own architecture (see
+   below).
+
+   **Verification that v2's true ceiling is still 100%, not 80.63%:** the
+   killed `_v3` run (same v2 architecture, `search_size=1,500,000`) had
+   already recorded multiple `Utilization=1.00, Cycles=1,073,741,824`
+   samples (tagged `L3[O]`/`L3[WO]`) in its raw `log.txt` before being
+   killed — proof the 100%-utilization ceiling is reachable under v2's
+   architecture, just not by every mapping, and not within default search
+   depth.
+
+   **Follow-up: reran `primary_v_v2` fresh (`primary_v_v2_rerun`, identical
+   architecture and default search budget, new output dir) expecting the
+   unseeded `random_pruned` search to land somewhere different by chance.**
+   It didn't — the new run's `log.txt` is **byte-for-byte identical** to the
+   original `primary_v_v2` run, same sample sequence, same thread
+   assignments, same final answer (`Utilization=0.81, Cycles=1,331,701,751`,
+   weight-stationary). **This means the mapper's `random_pruned` search is
+   deterministic given the same config/budget, not randomly seeded per
+   invocation** — a real, useful finding in its own right: v2's 80.63%
+   result isn't bad luck that a rerun would fix, it's *the* answer this
+   search depth always converges to. Reaching the true 100% ceiling requires
+   materially more search depth, not another attempt at the same depth.
+
+   **Decision: did not pursue a deeper bounded search further.** From the
+   killed `_v3` log, the 100%-utilization sample only appeared close to a
+   thread's *entire* 375,000-mapping quota (`search_size=1,500,000` ÷ 4
+   threads) — the same depth that caused the earlier multi-day runaway, with
+   no evidence a moderate middle-ground budget would reach it reliably.
+   Given the mechanism is already fully explained (ridge-doubling breaks the
+   specific v1-winning schedule; a different schedule still hits 100% under
+   v2 but needs deep search to find; default search is deterministic, not
+   unlucky), a clean formal 100%-utilization number for v2's ·V was judged
+   not worth chasing further — the "deterministic local optimum requiring
+   deep search to escape" result is itself a legitimate, citable Phase 1c
+   finding about the mapper tool's own behavior, not a gap needing to be
+   closed.
+
+### Third finding: this Phase 1c setup structurally cannot model "fused" at all
+
+Noticed while reviewing the DRAM traffic lines across every run: QK^T's
+`Outputs` and ·V's `Inputs` both show the identical 137,438,953,472 B (one
+full P round-trip) in *every* run — v1, v2, every dataflow the mapper found.
+Not a mapping/dataflow effect: `problem_qkt.yaml` and `problem_v.yaml` are
+two independent Timeloop problems, each with its own DRAM-level I/O, with no
+on-chip path connecting one kernel's output to the next kernel's input. **No
+mapper search, however deep, can ever produce a fused result here** — the
+limitation is in the problem formulation, not the search.
+
+This matters because Phase 1b's entire scratchpad/accumulator sizing
+exercise (`tile_q`, `tile_k`, online-softmax accumulator state) was designed
+specifically to *enable* fusion (P never touching HBM, flash-attention
+style) — meaning **Phase 1c as built has never actually exercised the
+regime Phase 1b's hardware hypothesis was built around.** Findings #1 and
+#2 above are both fully valid, but both are characterizing the *unfused*
+regime only.
+
+**Decision: not worth building a true fused Timeloop model.** Vanilla
+Timeloop's problem format is built around mapping one GEMM/conv onto a
+memory hierarchy — representing "two matmuls with an intermediate tensor
+that never leaves the chip" isn't a native capability; forcing it would
+mean hacking the architecture model (e.g. artificially zeroing P's DRAM
+cost) rather than getting a real answer. A real Gemmini RTL pipeline can
+*literally* keep P in scratchpad between the two matmuls — no
+fusion-modeling hack needed, just the loop nest as written. So: **fusion
+validation is being deferred to Phase 1d**, where it's a natural
+consequence of the RTL rather than something Timeloop needs to fake.
+
+**Open footnote for the writeup**: if a rough "fused-equivalent" number is
+wanted before Phase 1d lands, it can be hand-projected cheaply — subtract
+the shared P-traffic bytes/energy from the existing QK^T and ·V Timeloop
+results using Phase 1a's own byte formulas, rather than rerunning anything.
+Not yet computed; logged here as a lightweight stopgap option, not a
+substitute for Phase 1d's real validation.
+
+---
+
+## Key Takeaways (Phase 1c) — for final writeup
+
+1. **The ridge point is a property of the specific accelerator being
+   modeled, not a fixed workload characteristic.** Phase 1a's TPU
+   v5e-derived ridge point (480.5) doesn't transfer to a deliberately
+   smaller single-array Timeloop/Gemmini model — this architecture's own
+   ridge (≈80.08, from 6× lower peak compute at the same real HBM
+   bandwidth) is what actually determines its compute-vs-memory-bound
+   regime. Any time a Phase 1a/1b roofline conclusion is checked against a
+   Phase 1c/1d tool result, the ridge point has to be recomputed for the
+   actual modeled hardware.
+2. **How much dataflow choice matters is itself regime-dependent.** Near/
+   below an architecture's own ridge point (v1, easy to saturate),
+   competing dataflows can be essentially fungible — weight- and
+   output-stationary tied at 100% utilization within a rounding error. Once
+   an architecture change pushes the ridge higher (v2, harder to saturate),
+   the same mapping that used to tie for optimal can fall far behind, and
+   which dataflow "wins" starts to matter a great deal more. Dataflow
+   sensitivity isn't a fixed property of the workload — it depends on how
+   much headroom the architecture has relative to its own ridge.
+3. **A single mapper run's "winner" is not necessarily the architecture's
+   true optimum — it's whatever a deterministic, budget-limited search
+   happens to find.** Confirmed directly: rerunning the identical config
+   produced a byte-for-byte identical search log and the same answer.
+   Escaping a suboptimal result requires more search depth (or narrowing the
+   space), never just another attempt at the same depth — a methodological
+   lesson for interpreting *any* Timeloop mapper result, not just this one.
+4. **A tool's structural modeling limitations can silently scope out the
+   exact regime you built the hardware hypothesis to test.** This Phase 1c
+   setup (two independent per-kernel Timeloop problems) can only ever
+   represent the unfused case, no matter how the architecture or mapper
+   search is varied — yet fusion was the entire premise behind Phase 1b's
+   scratchpad/accumulator sizing. Worth checking, for any tool used in this
+   project, whether its native problem representation can even express the
+   hypothesis being tested before trusting its results as validation of it.
+
+**Phase 1c status: both open findings from the recovered results are
+resolved at the mechanistic level (finding #1: ridge point is
+architecture-specific, not carried over from Phase 1a's TPU v5e reference;
+finding #2: real ridge-doubling effect on a specific mapping, compounded by
+a deterministic default-search limitation, not true search-variance/luck),
+plus a third structural finding (this setup cannot model fusion at all,
+deferred to Phase 1d rather than hacked around in Timeloop). Phase 1c's
+comparison-and-gap-explanation step is complete. Next milestone per the
+spec: Phase 1d (configure Gemmini, read the generated RTL, validate via
+Verilator).**
