@@ -355,17 +355,174 @@ separate deliverables rather than one number.
 
 ---
 
+---
+
+## Phase 1c: Communication volume under load imbalance (the real case)
+
+### Correction to an earlier logged assumption
+
+The Phase 1a/1b "Open items" note above stated *"Token-dropping is
+training-only — paper explicitly states no dropping at evaluation."* This
+was **wrong** — caught by re-reading the actual paper text (§2.2.4), not
+trusted from memory. The real quote: *"we can flexibly decide whether to
+drop tokens during inference according to the efficiency requirements, and
+always ensure consistency between training and inference."* Dropping is an
+**optional, deployable-at-inference mechanism**, not training-only. Also
+locked down from the same passage: **CF = 1.0 exactly** (strictest possible,
+no slack above the average), **device-level** (not expert-level — a good
+match for this project's 8-device EP-group model), drop criterion is
+**lowest-affinity-score tokens first** (not random), and **~10% of training
+sequences are protected from ever being dropped** (fairness guarantee, not
+relevant to volume math).
+
+### Imbalance magnitude — literature search
+
+Deliberately avoided reaching for an unfounded heuristic (an early instinct
+to invoke "Pareto principle" by analogy was rejected — no MoE-specific
+evidence for that shape). Two real, cited findings instead:
+
+- **Gini coefficient of expert load ≈ 0.70** (baseline, before mitigation),
+  averaged across measured open-source MoE models **including DeepSeek-V3**,
+  from "Latent Prototype Routing" (arXiv 2506.21328). Their method reduces
+  this to 0.035. Not DeepSeek-V2-specific, and Gini alone doesn't give a
+  usable "busiest device gets Nx average" number without assuming a
+  distribution shape — flagged as a reason to prefer the second finding.
+- **GPU stall time up to 70% under skewed routing**, measured on real
+  Mixtral-8×7B serving (databricks-dolly-15k, 100 req/s, DGX A100 40GB,
+  SGLang expert-parallel) — "Toward Cost-Efficient Serving of
+  Mixture-of-Experts with Asynchrony" (arXiv 2505.08944). This is
+  device-level and directly translatable into a load ratio: if a device is
+  idle 70% of a step waiting on the hot device, it was only doing useful
+  work the remaining 30% — implying the hot device's load ≈ 1/0.30 ≈
+  **3.3× the average**. Used as the working multiplier. Cross-validated
+  against the Gini finding (both independently imply severe, multi-x
+  imbalance) — chose to stop searching here given two independent numbers
+  converged, rather than chase a third (an earlier "2.9×" figure surfaced
+  in a search summary but could not be verified in any of five checked
+  source papers — dropped rather than cited).
+- Neither number is DeepSeek-V2-specific, and Mixtral (8 experts, top-2) is
+  architecturally quite different in scale from this workload (160 experts,
+  top-6, device-limited) — carried forward as a magnitude anchor, not a
+  precise prediction, consistent with the spec's "realistic, not invented"
+  bar rather than requiring exact precision.
+
+### Per-device decomposition (the key structural correction)
+
+Naively multiplying *all* of Phase 1b's per-device FLOPs and bytes by the
+imbalance multiplier leaves the FLOPs/byte ratio **unchanged** (scales
+numerator and denominator identically — would make the whole phase
+pointless). The fix: split per-device FLOPs by *why* they occur.
+
+- `F_expert` = 3 × 2 × d_model × d_ff = 47,185,920 FLOPs/token/expert (same
+  shape for shared or routed)
+- `F_shared,device` = (T/8) × 2 × F_expert = **96,636,764,160 FLOPs**
+  (≈96.6 GFLOPs) — driven by how many tokens call *this device home*,
+  **independent of routing popularity**, does not scale with the imbalance
+  multiplier
+- `F_routed,device` = (T/8) × 6 × F_expert = **289,910,292,480 FLOPs**
+  (≈289.9 GFLOPs) — driven by inbound-dispatched tokens, **scales with the
+  multiplier**
+- `B_device` = (T/8) × 2 × P × R = **13,762,560 bytes** (≈13.1 MiB,
+  matches 105 MiB ÷ 8 exactly) — also driven entirely by inbound-dispatched
+  tokens, **scales with the multiplier**
+
+where T=8,192, P=2,560 bytes (FP4 payload), R=2.625 (Phase 1b's
+expected-remote-devices figure).
+
+### Dropping-off (uncapped) — sensitivity sweep
+
+Applying the multiplier only to `F_routed,device` and `B_device`:
+
+| Stall % | Multiplier | Device FLOPs | Device bytes | AI (FLOPs/byte) |
+|---|---|---|---|---|
+| 70% (working number) | 3.33 | 1.05 TFLOPs | 43.3 MiB | 23,193 |
+| 80% | 5.0 | 1.55 TFLOPs | 65.5 MiB | 22,469 |
+| 90% | 10.0 | 3.00 TFLOPs | 131.1 MiB | 21,767 |
+| 95% | 20.0 | 5.90 TFLOPs | 262.2 MiB | 21,416 |
+| 97% | 33.3 | 9.75 TFLOPs | 437.0 MiB | 21,276 |
+| 99% | 100.0 | 29.09 TFLOPs | 1.31 GiB | 21,135 |
+
+**Structural finding**: as the multiplier → ∞, `F_shared,device` becomes
+negligible and the ratio converges to a **hard, imbalance-proof floor**:
+`3 × F_expert / (P × R) ≈ 21,065 FLOPs/byte` — a pure function of DeepSeek's
+expert shape (`d_ff`) and routing fan-out (`R`), with **zero dependence on
+imbalance severity or hardware**. Ridge point (≈4,208 FLOPs/byte, TPU 8i
+FLOPS ÷ ICI bandwidth) sits **entirely below this floor** — meaning **no
+amount of imbalance, however extreme, can flip this workload comms-bound**
+on this hardware at this precision. The 70%→99% sweep only erodes headroom
+from 6.7× (uniform) to ~5.0× (floor) — imbalance turned out to barely move
+the needle at all.
+
+### Precision sensitivity (what actually can flip the verdict)
+
+The floor scales inversely with dispatch-payload precision (`payload_bytes`
+in `18 × d_ff / (payload_bytes × R)`):
+
+| Precision | Payload bytes | Floor (FLOPs/byte) | Margin vs. ridge (4,208) |
+|---|---|---|---|
+| FP4 (current) | 0.5 | 21,065 | ~5.0× |
+| FP8 | 1.0 | 10,533 | ~2.5× |
+| FP16/BF16 | 2.0 | 5,266 | ~1.25× (thin) |
+| FP32 | 4.0 | 2,633 | **below ridge — flips comms-bound** |
+
+**Exact crossover precision ≈ 2.50 bytes/element** — anything FP16-or-finer
+keeps this workload compute-bound regardless of hardware generation or
+imbalance; anything coarser flips it. This is a far more sensitive lever
+than imbalance severity, and directly sharpens the "revisit if numbers end
+up close" precision caveat flagged back in Phase 1b — now with an exact
+threshold rather than a vague flag.
+
+### Dropping-on (CF=1.0) — the third leg of the range
+
+Since CF=1.0 caps the device's *realized* load at exactly the average, its
+FLOPs/bytes/AI are **identical to the uniform Phase 1b baseline**
+(28,087 FLOPs/byte) — the interesting output of this case isn't a
+comms/compute ratio at all, it's the **dropped-token fraction**:
+
+- Desired load = 3.3× average, allowed = 1.0× average, excess = 2.3×
+- **Dropped fraction of that device's desired traffic = 2.3 / 3.3 ≈ 69.7%**
+
+Initial reaction ("70% dropped = model quality is horrible") was
+overgeneralized — corrected on reflection to three scoping facts: (1) this
+is **one device's** demand, not system-wide (other 7 devices are
+correspondingly *under* average by conservation); (2) a drop costs a token
+**one expert out of 8** (2 shared + 6 routed), not the whole token's
+computation; (3) the drop rule specifically targets each token's
+**lowest-affinity pick**, not a random sample. Net: a real but narrow,
+deliberately-cushioned cost, not a broad quality collapse — though the
+exact system-wide magnitude is left unresolved (don't know what fraction of
+all tokens even want the hot device in the first place).
+
+### Phase 1c summary — the three-point range
+
+| Case | Bottleneck-device AI | Verdict | Cost |
+|---|---|---|---|
+| Uniform (1b) | 28,087 FLOPs/byte | Compute-bound, 6.7× margin | None (idealized) |
+| Dropping-on (CF=1.0) | 28,087 (identical) | Compute-bound, 6.7× margin | ~69.7% of one device's excess demand dropped |
+| Dropping-off (uncapped) | 23,193 → floor 21,065 | Compute-bound, ~5.0-5.5× margin | No drops, but real stall/buffer pressure |
+
+**Headline conclusion**: this workload is **robust to realistic load
+imbalance** on TPU 8i at FP4 — every case stays decisively compute-bound.
+The dispatch/combine interconnect is not the bottleneck here; if anything
+tips this workload comms-bound, it will be a **numerics decision**
+(dispatch precision coarser than ~2.5 bytes/element), not routing skew.
+
+---
+
 ## Next step
 
-Phase 1b complete. Two outstanding items, per `moe_handoff.md`:
+Phase 1c complete — closes out the "Deliverable for Phase 1" from the
+project spec (uniform + imbalanced comms volume, compute-to-comms ratio,
+first-pass network-bound prediction). Two outstanding items:
 
 1. **Phase 0** (still not executed): build ASTRA-sim locally via Docker.
-   Boilerplate/tooling, not blocking further hand-derivation, but needed
-   before Phase 3 (simulation) can happen.
-2. **Phase 1c** (next real 🧠 work): derive comms volume under load
-   imbalance — research a realistic imbalance model from the actual MoE
-   literature (capacity factor, the paper's α1/α2/α3 balance-loss
-   coefficients — which one grounds the right model is still unresolved —
-   and whether token-dropping, stated as training-only in the paper, is
-   even a valid assumption to import into this inference-focused analysis).
-   Flagged as the phase most likely to balloon in scope — pace carefully.
+   Needed before Phase 3 (simulation) can happen — nothing in 1a/1b/1c
+   required it, since all of Phase 1 was hand-derivation.
+2. **Phase 2** (next real 🧠 work): predict the ideal system architecture —
+   topology, bandwidth allocation, buffering/SRAM — informed by Phase 1's
+   findings. Notably, the "imbalance barely matters, precision matters a
+   lot" conclusion should directly shape the topology/bandwidth hypothesis:
+   headroom is wide enough that exotic imbalance-driven topology choices
+   (e.g. extra bandwidth earmarked for popular-expert links) may be less
+   load-bearing than they first appeared going into this phase — worth
+   testing that instinct explicitly rather than assuming it.
