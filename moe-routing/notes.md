@@ -510,20 +510,185 @@ tips this workload comms-bound, it will be a **numerics decision**
 
 ---
 
+## Phase 2: Predicted system architecture (hand-derived hypothesis)
+
+Companion to Phase 1's numbers — not yet validated in ASTRA-sim, that's
+Phase 3. Covers the spec's three questions: topology, bandwidth allocation,
+buffering/SRAM.
+
+### Topology — direct full mesh across the 8-device EP group
+
+**Starting instinct**: MoE dispatch/combine is "all-to-all-ish," the way
+real systems (e.g. NVIDIA NVSwitch-based racks) handle it — worth checking
+what property of NVSwitch actually earns that reputation before assuming
+it transfers here.
+
+**Traffic-pattern precision, worked out in discussion**: device-limited
+routing caps a single *token's* fan-out at M≤3 of 8 devices (Phase 1a/1b),
+but which 3 devices varies token-by-token based on content-driven router
+affinity — unrelated to which device happens to host the token. Aggregated
+over a device's ~1,024-token local batch, this means a device's *aggregate*
+traffic is effectively any-to-any across all 7 peers, even though no single
+token ever needs more than 3. The per-token cap doesn't shrink the topology
+requirement — only the per-token hop count.
+
+**NVSwitch mechanism, verified (not assumed)**: internal crossbar — every
+input port cross-connected to every output port — giving any GPU→GPU pair a
+single hop at full bandwidth, non-blocking (no pair's transfer steals
+bandwidth from another pair, so long as the switch's own total capacity
+isn't exceeded). Verified via search, not trusted from memory:
+- [What Is NVSwitch? The Silicon Behind NVIDIA's GPU Cluster Scale-Out](https://www.nextpcb.com/blog/what-is-nvswitch-nvidia-gpu-cluster-scale-out)
+- [NVIDIA NVSwitch Technical Overview](https://images.nvidia.com/content/pdf/nvswitch-technical-overview.pdf)
+
+**Mesh vs. switch tradeoff, worked through directly**:
+- Direct mesh: eliminates the switch "middleman" → lower latency, but
+  O(N²) link count (28 links at N=8) constrained by pins/board space/heat —
+  infeasible fast as N grows.
+- Switch fabric: a chip's bandwidth budget isn't pre-partitioned into fixed
+  per-peer slices the way mesh's dedicated links are — it flexibly follows
+  wherever demand actually is (statistical multiplexing), which matters
+  specifically under **imbalanced** traffic (a mesh chip talking heavily to
+  1–2 peers is capped at ~1/7 of its budget per link; a switched chip isn't).
+  Caveat: this doesn't make contention disappear, it moves where it can
+  occur — from the sender's dedicated links to the *destination's* incoming
+  link, if multiple senders pile onto the same hot device at once.
+
+**The deciding factor — latency vs. bandwidth sensitivity**: dispatch
+payload is tiny (2,560 bytes/hop, FP4, from Phase 1b). Transfer time at TPU
+8i's 2.4 TB/s ICI bandwidth = 2,560 / 2.4×10¹² ≈ **1.07 ns** — utterly
+dwarfed by typical fixed per-hop latency (tens–hundreds of ns). This
+workload is **latency-dominated, not bandwidth-dominated** at decode-step,
+per-token granularity. That undercuts the switch's main advantage
+(bandwidth multiplexing barely matters when bandwidth is already this
+abundant relative to payload) and reinforces mesh's main advantage (no
+middleman hop).
+
+**Real-world resolution of the mesh-vs-switch tension**: TPU 8i doesn't
+actually use a centralized switch chip at all — it uses **hierarchical
+direct mesh** ("Boardfly"): full mesh at 4 chips/board, full mesh at 8
+boards/group, full mesh at 36 groups/pod (1,152 chips total). Each tier is
+kept small enough that full mesh's O(N²) wiring stays feasible, avoiding
+the need for a dedicated switch ASIC while still reaching pod scale via
+nesting. [Google Cloud TPU 8i technical deep dive](https://cloud.google.com/blog/products/compute/tpu-8t-and-tpu-8i-technical-deep-dive)
+
+**Conclusion**: **direct full mesh across the 8-device EP group** (28
+dedicated links) — matches the tier size TPU 8i itself already treats as
+mesh-feasible, and fits this workload's latency-dominated regime better
+than routing through a switch would.
+
+### Bandwidth allocation — uniform across all 28 links
+
+Question: provision uniformly, or give popular-expert links extra headroom?
+
+**Argument 1 (sufficient on its own)**: Phase 1c's compute-bound headroom
+survives even the most extreme modeled imbalance (99% stall → floor
+≈21,065 FLOPs/byte, still ~5× above the ridge point of 4,208). There's no
+scenario in the modeled range where comms actually becomes the bottleneck,
+so extra link bandwidth has no exploitable payoff — the tail case that
+extra bandwidth would be protecting against was already tested and stays
+fine without it.
+
+**Argument 2 (raised, then partially undercut, doesn't end up mattering)**:
+initial objection — non-uniform provisioning is a wiring-time decision
+trying to anticipate a routing pattern that's data-dependent and can shift
+decode-step to decode-step, so you can't know which links to favor in
+advance. Tested this by asking whether expert popularity is actually
+*persistent/structural* (e.g. semantic specialization) rather than purely
+transient — if persistent, the objection weakens, since popularity could be
+profiled ahead of time.
+
+Searched rather than assumed (this is the same move — invoking a Pareto-
+style heuristic by analogy — that was explicitly rejected in Phase 1c for
+lack of MoE-specific evidence; caught the parallel and backed it with real
+citations this time instead of re-using the rejected shortcut):
+- "A Closer Look into Mixture-of-Experts in Large Language Models" (arXiv
+  2406.18219): *"in some layers of DeepSeek, there is an expert selected by
+  most tokens"* — DeepSeek-specific finding.
+- "Do Domain-specific Experts exist in MoE-based LLMs?" (arXiv 2604.05267,
+  Apr 2026, preprint — not yet peer-reviewed, flagged as such): evaluated
+  10 MoE LLMs (3.8B–120B params), found empirical evidence for genuine
+  domain-specific expert specialization, not random per-token routing.
+
+Real evidence for structural/persistent popularity exists — the design-time
+objection is weaker than it first looked. **Doesn't change the conclusion**,
+though: Argument 1 alone is sufficient, and there's no payoff to the added
+complexity even with Argument 2 weakened. Uniform wins on headroom +
+Occam's razor.
+
+### Buffering/SRAM — CF=1.0 is what makes on-chip buffering feasible
+
+Question: how much on-chip buffering does a device need to avoid stalling
+on in-flight dispatch/combine traffic?
+
+**Conservative framing, chosen deliberately**: assume no pipelining (a full
+layer's dispatch+combine traffic must be resident before compute proceeds)
+rather than assuming an optimistic overlap window — partly because SRAM is
+shared with on-chip needs Phase 1a never sized (matmul operand tiles,
+activation staging, router scratch; Phase 1a only budgeted the *HBM* side,
+weights + KV cache).
+
+Checked against two numbers already derived in Phase 1c's per-device
+decomposition, against TPU 8i's 384 MB SRAM budget:
+
+| Case | Device bytes (one layer) | Fraction of 384MB SRAM |
+|---|---|---|
+| Uniform | ≈13.1 MiB (`B_device`) | ~3.4% |
+| Worst modeled imbalance (99% stall, 100× multiplier) | ≈1.31 GiB | **>340% — infeasible, alone** |
+
+The worst-case number is infeasible outright — more than 3× the *entire*
+SRAM budget, before a single byte is reserved for anything else on the
+chip.
+
+**Resolution**: CF=1.0 (device-level capacity-factor capping, dropping
+lowest-affinity tokens first — locked down in Phase 1c) caps a device's
+*realized* inbound traffic at exactly the uniform-case volume, regardless
+of how skewed the underlying demand is. This reframes CF=1.0 from "one
+point in Phase 1c's three-way range" into a **practical necessity once
+buffering is considered** — the dropping-off/uncapped alternative isn't
+just costlier, it's physically infeasible on-chip past fairly mild
+imbalance (even 80% stall / 5× multiplier already needs 65.5 MiB just for
+network buffers, eating a real chunk of the 384MB budget before anything
+else).
+
+**Buffering requirement, with CF=1.0 assumed: ≈13.1 MiB/device**,
+comfortably within the 384MB SRAM budget (~3.4%), leaving the remaining
+~96.6% for everything else sharing that memory.
+
+### Correction to the "imbalance barely matters" framing
+
+The handoff's carried-forward Phase 1c conclusion — "imbalance barely
+moves the needle" — holds specifically for the **compute-vs-comms ratio**,
+which had wide headroom to absorb it (6.7×→~5×). It does **not** hold for
+**buffering**: SRAM is a hard physical capacity wall with no equivalent
+headroom, and uncapped imbalance blows straight past it. Buffering is the
+one place in Phase 2 where imbalance genuinely bites — and CF=1.0 capacity
+capping (not pipelining, not overprovisioned SRAM) is the concrete
+mechanism that resolves it.
+
+### Phase 2 summary
+
+| Question | Answer | Key reason |
+|---|---|---|
+| Topology | Direct full mesh, 8 devices | Latency-dominated (transfer time ~1ns ≪ hop latency); matches TPU 8i's own mesh-tier precedent |
+| Bandwidth allocation | Uniform across all 28 links | Compute-bound headroom survives worst-case imbalance; no exploitable payoff to non-uniform |
+| Buffering/SRAM | ≈13.1 MiB/device, requires CF=1.0 | Uncapped imbalance is infeasible (>3× the whole SRAM budget); capacity-factor capping is load-bearing, not optional |
+
+---
+
 ## Next step
 
-Phase 1c complete — closes out the "Deliverable for Phase 1" from the
-project spec (uniform + imbalanced comms volume, compute-to-comms ratio,
-first-pass network-bound prediction). Two outstanding items:
+Phase 2 complete (hand-derived hypothesis, not yet validated — that's
+Phase 3). Two outstanding items:
 
 1. **Phase 0** (still not executed): build ASTRA-sim locally via Docker.
-   Needed before Phase 3 (simulation) can happen — nothing in 1a/1b/1c
-   required it, since all of Phase 1 was hand-derivation.
-2. **Phase 2** (next real 🧠 work): predict the ideal system architecture —
-   topology, bandwidth allocation, buffering/SRAM — informed by Phase 1's
-   findings. Notably, the "imbalance barely matters, precision matters a
-   lot" conclusion should directly shape the topology/bandwidth hypothesis:
-   headroom is wide enough that exotic imbalance-driven topology choices
-   (e.g. extra bandwidth earmarked for popular-expert links) may be less
-   load-bearing than they first appeared going into this phase — worth
-   testing that instinct explicitly rather than assuming it.
+   Needed before Phase 3 (simulation) can happen — nothing in 1a/1b/1c/2
+   required it, since Phases 1 and 2 were both hand-derivation.
+2. **Phase 3** (next real 🧠+🔧 work): configure ASTRA-sim with Phase 2's
+   hypothesis (8-device full mesh, uniform bandwidth, CF=1.0-bounded
+   buffering) and sweep topology/bandwidth variants around it. Compare
+   against this hand-derived prediction — same gap-hunting standard as the
+   attention project. Notable candidate for where a real gap might show up:
+   per-hop latency assumptions (the mesh conclusion leaned heavily on "fixed
+   latency dominates" — worth checking whether ASTRA-sim's latency model
+   agrees with that framing, or reveals something Phase 2's hand-derivation
+   underweighted).
