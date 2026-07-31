@@ -1044,3 +1044,105 @@ Ready for Phase 1c (Timeloop sweep).
   and its calibrating Matmul-vs-Conv data point, and the Phase 1b/1c
   division-of-labor framing. **`notes.md` and `handoff.md` both
   fully up to date — Phase 1b genuinely complete, ready to start Phase 1c.**
+
+---
+
+## Phase 1c: Timeloop Sweep — Recovered State (session-loss incident)
+
+**Context:** Phase 1c was run end-to-end in a separate Claude Code session
+(working directly in the `timeloop-accelergy-exercises` docker environment,
+not this repo) that was destroyed when the repo got renamed mid-session. The
+tool artifacts and Docker container survived on disk; this section
+reconstructs the factual record (configs, results, raw mapper output) from
+those surviving files so nothing is lost. **This is a factual log, not a
+re-derivation** — interpretation of the open findings below is still
+outstanding Phase 1c/1d work.
+
+### Artifacts (in `timeloop-accelergy-exercises/workspace/attention_1c/`)
+
+- `problem_qkt.yaml` / `problem_v.yaml` — QK^T and ·V expressed as Timeloop
+  conv-style GEMMs. Confirmed: `C·M·N·G = 2^44` MACs for each, matching
+  Phase 1a's QK^T/·V FLOPs exactly (sanity check comment in each file).
+- `arch.yaml` — Phase 1b's architecture translated into Timeloop: 128×128 PE
+  array (sweepable via `run_one.py` args), 1 MiB scratchpad / 256 KiB
+  accumulator (sweepable), DRAM at TPU v5e HBM bandwidth. Dataspace
+  `keep`/`bypass` deliberately left **unconstrained** at the scratchpad
+  level, so the mapper has to discover K/V-stationary on its own rather than
+  being told — the actual Phase 1c test of the Phase 1b hypothesis.
+- `mapper.yaml` / `run_one.py` — `random_pruned` mapper, optimizing EDP;
+  `run_one.py` takes `(problem, out_dir, mesh_x, mesh_y, scratch_depth,
+  accum_depth, [search_size, victory_condition, timeout])`.
+
+### Runs completed (real Timeloop output, from `outputs/*/timeloop-mapper.stats.txt` + `.map.txt`)
+
+| run | clock model | kernel | Utilization | Cycles | Winning map: scratchpad-resident dataspace |
+|---|---|---|---|---|---|
+| `test_qkt` | — | QK^T, 1×1 array (sanity check) | 1.56% | 68,719,476,736 | — |
+| `primary_qkt` | 1 GHz, uniform rate | QK^T | **100%** | 1,073,741,824 (=2^30, exact compute-bound ideal) | **none** — Scratchpad level empty in winning map |
+| `primary_qkt_v2` | 2 GHz, int8-pumped rate (DRAM BW halved in words/cycle to hold bytes/s fixed — a modeling correction made mid-session) | QK^T | **100%** | 1,073,741,824 | none — same as v1 |
+| `primary_v` | 1 GHz | ·V | **100%** | 1,073,741,824 | `Outputs:16384` — mapper chose **output-stationary** |
+| `primary_v_v2` | 2 GHz corrected | ·V | 80.63% | 1,331,701,751 | `Weights:1048576` (full 1 MiB) — mapper chose **weight-stationary** (V-stationary, matching the Phase 1b hypothesis) but landed in a worse local optimum than v1's output-stationary result |
+
+DRAM traffic in `primary_qkt`'s winning map: `Weights(K):268,435,456 B` (256
+MiB, matches Phase 1a's GQA K bytes exactly) + `Inputs(Q):2,147,483,648 B` (2
+GiB) + `Outputs(P):137,438,953,472 B` (128 GiB — one full P-write to DRAM,
+i.e. this run models QK^T **unfused**, matching Phase 1a's single P
+round-trip term exactly). `primary_v`'s DRAM `Inputs` shows the same
+137,438,953,472 B, i.e. this P traffic is read back in for ·V — consistent
+with the two kernels being modeled as separate, unfused GEMMs rather than a
+fused flash-attention-style pipeline.
+
+### `_v3` runs: bigger search budget, killed before completion
+
+`primary_qkt_v3` / `primary_v_v3` used the identical v2 architecture (128×128,
+1 MiB scratch, 256 KiB accum, 2 GHz corrected model) with a much larger
+mapper search budget (`search_size=1,500,000`, `victory_condition=30,000`,
+`timeout=300,000`, vs. the earlier runs' defaults of ~200,000/5,000/100,000)
+— an attempt to get a higher-confidence/more-exhaustive answer, particularly
+given `primary_v_v2`'s suboptimal 80.63% result above.
+
+Both jobs ran for **over 2 days** (discovered still running, ~99% CPU each,
+when this session started). Per-job, 2 of 4 mapper search threads had
+already terminated cleanly (one via the 375,000-valid-mappings cap, one via
+the 30,000-stale-mappings victory condition) and their raw `log.txt` already
+recorded the same 100%-utilization / 1,073,741,824-cycle mapping found in
+`primary_qkt`/`primary_v`. The other 2 threads per job had not yet printed a
+termination line after 2+ days.
+
+**Decision made:** killed both jobs (container-internal PIDs, via `docker
+exec ... kill`) rather than let them keep running. Rationale: 100%
+utilization is the theoretical ceiling for this MAC count/array size — it
+was already found — so remaining runtime could only be chasing marginal EDP
+(energy) improvements at the same cycle count, not a different or better
+answer, and open-ended multi-day runtime for that isn't worthwhile. No
+`stats.txt`/`map.txt` exists for `_v3` (the parse step needs all 4 threads to
+finish; only raw `log.txt` survives). If a complete `_v3` record is wanted
+later for the writeup, rerun with a bounded `search_size` (e.g. 375,000,
+matching what thread 0 already completed in the killed runs) so it
+terminates in a normal window instead of open-ended.
+
+### Open findings carried forward (NOT resolved — flagged for Phase 1c/1d interpretation)
+
+1. **QK^T's winning mapping keeps nothing resident in scratchpad at all**
+   (no K/V-stationary reuse), directly contradicting the Phase 1b hypothesis
+   that K/V should be scratchpad-resident — yet still achieves the ideal
+   100%-utilization compute-bound cycle count, even though the modeled DRAM
+   traffic includes the full *unfused* 128 GiB P-write (which Phase 1a
+   predicted should be decisively memory-bound, at AI≈126 vs. a ridge point
+   of ≈480.5). Worth checking: is 480.5 (derived from full TPU v5e, 4 MXUs)
+   even the right ridge point to compare against here, given this Timeloop
+   architecture models a single 128×128 array, not a full TPU v5e chip? The
+   architecture's *own* peak-compute/peak-bandwidth ratio may differ
+   substantially from the TPU v5e number carried over from Phase 1a.
+2. **·V's winning dataflow was qualitatively different between v1 and v2**
+   (output-stationary @ 100% util vs. weight-stationary @ 80.63% util) even
+   though the only thing that changed between those two runs was the
+   clock-rate/DRAM-bandwidth modeling correction, not the architecture or
+   hypothesis being tested. Whether this is mapper search variance (the
+   `random_pruned` mapper simply landing in a different local optimum) or a
+   real consequence of the bandwidth-model fix is unresolved.
+
+**Phase 1c status: substantial real Timeloop data recovered and logged: not
+yet compared point-by-point against the Phase 1b hypothesis, and the two
+open findings above are not yet explained. That comparison/explanation is
+the next real step.**
