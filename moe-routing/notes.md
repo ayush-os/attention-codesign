@@ -1,8 +1,9 @@
 # MoE Routing Project — Notes (Phase 0 / Phase 1a)
 
-Companion to `moe_routing_project_spec.md`. Mirrors the collaboration mode and
-logging style of `phase1_notes.md`/`handoff.md` from the attention codesign
-project — this is the second project in that same self-directed arc.
+Companion to `spec.md`. Mirrors the collaboration mode and
+logging style of `../attention/notes.md`/`../attention/handoff.md` from the
+attention codesign project — this is the second project in that same
+self-directed arc.
 
 ---
 

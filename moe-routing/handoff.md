@@ -3,7 +3,7 @@
 **Purpose:** read this first when picking the MoE routing project back up in a
 new session — it's the short "where things stand" pointer. Full derivation
 trail, sourced numbers, and the reasoning behind every choice lives in
-`moe_phase1_notes.md`; don't re-derive anything already logged there.
+`notes.md`; don't re-derive anything already logged there.
 
 **Status as of this handoff:** Phase 1 fully complete (1a workload shape, 1b
 uniform comms volume, 1c load-imbalance modeling). **Next up: Phase 2 —
@@ -14,7 +14,7 @@ separate, non-blocking tooling task, still not executed.
 
 ## Start here: Phase 2 — predict the ideal system architecture
 
-Per `moe_routing_project_spec.md`, Phase 2 asks for a hand-derived hypothesis
+Per `spec.md`, Phase 2 asks for a hand-derived hypothesis
 (not yet validated in a tool — that's Phase 3) covering:
 - **Topology**: given the dispatch/combine communication pattern
   (data-dependent, all-to-all-ish), what interconnect topology fits, and
@@ -43,8 +43,9 @@ keeping in mind if Phase 2's reasoning brushes up against numerics at all.
 ## Collaboration mode — read before responding to anything
 
 Same self-directed-learning constraint as the attention project (see its own
-`handoff.md` for the fuller version): check reasoning, ask questions that
-expose gaps, don't hand over derivations the user hasn't produced themselves.
+`../attention/handoff.md` for the fuller version): check reasoning, ask
+questions that expose gaps, don't hand over derivations the user hasn't
+produced themselves.
 
 **Exceptions the user has explicitly invoked in this project:**
 - Pure arithmetic plug-in once the user has stated the formula — fine to
@@ -65,7 +66,7 @@ expose gaps, don't hand over derivations the user hasn't produced themselves.
 
 ---
 
-## Phase 1 results (full derivation in `moe_phase1_notes.md`)
+## Phase 1 results (full derivation in `notes.md`)
 
 **1b (uniform/ideal case)**: 105 MiB/layer dispatch+combine, whole system,
 one decode step. ≈28,087 FLOPs/byte vs. a TPU 8i ICI ridge point of
@@ -90,7 +91,7 @@ inference-time dropping at CF=1.0, device-level, lowest-affinity-first.
 
 ## Phase 0: ASTRA-sim still not built (separate, non-blocking)
 
-Plan (see `moe_phase1_notes.md` § Phase 0 status for full reasoning): local
+Plan (see `notes.md` § Phase 0 status for full reasoning): local
 Docker build on the Mac first (repo's Dockerfile is unpinned
 `ubuntu:22.04`, should build natively on arm64). Checkpoint is running the
 stock all-reduce example. Farmshare is fallback only, not default. **Still
@@ -102,11 +103,11 @@ hand-derivation, so no rush to interleave it.
 
 ## Where everything lives
 
-- `moe_routing_project_spec.md` — original spec, all phases.
-- `moe_phase1_notes.md` — full derivation trail for 1a/1b/1c, Prediction/Log
+- `spec.md` — original spec, all phases.
+- `notes.md` — full derivation trail for 1a/1b/1c, Prediction/Log
   style. Read it for the "why," not just the "what." Keep appending here
   for Phase 2.
 - This file — update/overwrite at the next natural pause point.
-- Sibling project: `codesign_project_spec.md` / `phase1_notes.md` /
-  `handoff.md` — the attention project this one extends. Phase 4 of this
-  spec asks for a synthesis connecting the two.
+- Sibling project: `../attention/spec.md` / `../attention/notes.md` /
+  `../attention/handoff.md` — the attention project this one extends.
+  Phase 4 of this spec asks for a synthesis connecting the two.

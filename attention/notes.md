@@ -1042,5 +1042,5 @@ Ready for Phase 1c (Timeloop sweep).
   finding and the deliberate choice not to hand-optimize past it, the two
   TPU-comparison-basis corrections (v1 and 8t/8i), the BigSP confirmation
   and its calibrating Matmul-vs-Conv data point, and the Phase 1b/1c
-  division-of-labor framing. **`phase1_notes.md` and `handoff.md` both
+  division-of-labor framing. **`notes.md` and `handoff.md` both
   fully up to date — Phase 1b genuinely complete, ready to start Phase 1c.**
