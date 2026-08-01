@@ -1,8 +1,8 @@
 # Handoff — Resume Here
 
-**Purpose:** this doc exists so a new chat session can pick up this project exactly where the last one left off, without needing to re-read the full `notes.md` history first. Read this doc first; use `notes.md` as the detailed reference/derivation trail when you need it.
+**Purpose:** this doc exists so a new chat session can pick up this project exactly where the last one left off, without needing to re-read the full Phase 1 derivation trail first. Read this doc first; use `prefill_notes.md` as the detailed Phase 1 reference when you need it.
 
-**Status as of this handoff:** Phase 1a, 1b, and 1c are all complete. **Next step: Phase 1d** — configure Gemmini, read the generated RTL, validate via Verilator.
+**Status as of this handoff:** **Phase 1 (prefill) is complete.** Next step: **Phase 2 (decode)** — repeat the full 1a→1d loop for decode-phase attention, the memory-leaning counterpart to Phase 1's compute-leaning prefill.
 
 ---
 
@@ -12,73 +12,54 @@ This is a **self-directed learning project**. The user is going from workload ch
 
 - When the user shares a hypothesis or derivation: probe assumptions, ask what they checked vs. asserted, don't supply the missing piece.
 - Exception: pure arithmetic plug-in *after* the user has established the formula themselves — the user has explicitly said they're fine delegating that (they don't want to be a human calculator once the reasoning is done). Still don't derive the formula itself for them.
-- Exception: factual/reference lookups (real hardware specs, tool defaults, "did we already log X") — verify via search rather than trusting memory, but don't extend this into doing their conceptual work.
-- Phase 0/tooling setup is explicitly marked 🔧 in the project spec (boilerplate, not learning-bearing) — fine to help directly and concretely there, unlike the 🧠-marked conceptual phases.
-- Continue logging into `notes.md` in the same Prediction/Log style rather than starting new files (except this handoff doc, which is meant to be overwritten/updated at each natural pause point, not appended to).
-- The user works well with concrete, quantified counterexamples/questions (e.g., "would an 8192×8192 array be physically buildable?") rather than abstract pushback — ground Socratic questions in numbers where possible.
-- When something surfaces mid-investigation that's cheaper to check by reading existing files/logs than by reasoning it out or running something new (e.g. "did an old raw search log already show X?"), do that lookup directly rather than asking the user to re-derive it — this has repeatedly turned out to be faster and more conclusive than new runs or hand-waving. Doesn't extend to the actual conceptual interpretation of what's found.
+- Exception: factual/reference lookups (real hardware specs, tool defaults, Gemmini/Chisel source behavior, "did we already log X") — verify via web search/source reading rather than trusting memory, but don't extend this into doing their conceptual work. This exception got real use in Phase 1d: resolving whether Gemmini has a native softmax unit, and whether its transposer supports the Phase 1b axis-routing assumption, were both legitimate direct lookups against Gemmini's actual GitHub source — see `prefill_notes.md` §4.5/§4.7 for how that looked in practice.
+- Phase 0/tooling setup is explicitly marked 🔧 in the project spec (boilerplate, not learning-bearing) — fine to help directly and concretely there, unlike the 🧠-marked conceptual phases. This extends to Farmshare toolchain/build debugging (env vars, Makefile regeneration, TIMEOUT_CYCLES, tmux) — drive that directly, only flag back when something is a genuine conceptual/architectural finding rather than a build error.
+- The user works well with concrete, quantified counterexamples/questions (e.g., "would an 8192×8192 array be physically buildable?", "how many cycles would the full workload take at this array's peak throughput, at Verilator's realistic kHz-range speed?") rather than abstract pushback — ground Socratic questions in numbers where possible.
+- When something surfaces mid-investigation that's cheaper to check by reading existing files/logs than by reasoning it out or running something new, do that lookup directly rather than asking the user to re-derive it. Doesn't extend to the actual conceptual interpretation of what's found.
+- **Scope is a legitimate, discussable topic, not just something to push through.** Phase 1d was deliberately descoped mid-project (see `prefill_notes.md` §4.1) after the user judged Phase 1c's signal-to-time ratio poor. When a phase's marginal learning value looks low relative to its time cost, it's fine — expected, even — to surface that directly and propose a recommendation, the way "is Phase 1d even worth doing" and "should we chase the softmax-granularity question" were both handled: give a real recommendation with reasoning, not just an open-ended question back.
+- **Logging convention**: keep a live working log in a fresh `notes.md`, in Prediction/Log style (prediction stated before checking, then the log entry once resolved), the same way Phase 1's derivation was tracked. At Phase 2's natural completion point, refactor/polish that into a standalone `decode_notes.md` (mirroring what was just done for Phase 1 → `prefill_notes.md`) — a finished writeup-style document, not a chronological journal, but with no substantive content lost. Update this `handoff.md` file (overwrite, don't append) at each natural pause point.
 
 ---
 
 ## Project structure (from `spec.md`)
 
-Phase 0 (Timeloop/Accelergy + Chipyard/Gemmini setup) → **Phase 1 (prefill, compute-leaning)** → Phase 2 (decode, memory-leaning) → Phase 3 (numerics/precision) → optional Phase 4 (real-hardware check). Phase 1/2 each follow: 1a hand-derive FLOPs/bytes/AI/ridge-point → 1b hypothesize PE array/dataflow/scratchpad → 1c sweep Timeloop, compare → 1d configure Gemmini, read generated RTL, run via Verilator, explain every gap vs. Timeloop.
+Phase 0 (Timeloop/Accelergy + Chipyard/Gemmini setup) → Phase 1 (prefill, compute-leaning — **complete**) → **Phase 2 (decode, memory-leaning)** → Phase 3 (numerics/precision) → optional Phase 4 (real-hardware check). Phase 1/2 each follow the same loop: 1a hand-derive FLOPs/bytes/AI/ridge-point → 1b hypothesize PE array/dataflow/scratchpad → 1c sweep Timeloop, compare → 1d configure Gemmini, read generated RTL, run via Verilator, explain every gap vs. Timeloop.
+
+**Fallback framing, worth keeping in mind**: per the spec, Phase 1 alone (which is now done) is already "a complete, defensible artifact." Phase 2/3/4 are additive, not required — so scope decisions for Phase 2 can be made with the same directness Phase 1d's scope-down was, without treating the original spec's ambition as non-negotiable.
 
 ---
 
-## Workload (locked in since Phase 1a)
+## Phase 1 (prefill): complete — summary
 
-Llama 3-70B prefill, from *How to Scale Your Model* (TPU serving chapter): batch=32, seq_len=8192, n_heads=64, n_kv_heads=8 (GQA), d_head=128, int8 throughout.
+**Full derivation, all four sub-phases, in `prefill_notes.md`.** Do not re-derive any of this — it's a finished, validated record. Skimming it (especially §5 "Cross-Phase Synthesis" and §6 "Open Threads Carried Forward") before starting Phase 2 is worth the few minutes.
 
-## Phase 1a results (full derivation in `notes.md`)
+The compressed version, just enough to orient Phase 2:
 
-- Total FLOPs (MHA = GQA, proven identical): 2^46
-- Bytes-moved: fused bound 8 GiB (MHA) / 4.5 GiB (GQA); unfused bound ≈520 GiB (MHA) / ≈516.5 GiB (GQA)
-- AI: fused 8192 (MHA) / ≈14,564 (GQA); unfused ≈126 (MHA) / ≈126.9 (GQA)
-- Ridge point: ≈480.5 FLOPs/byte (TPU v5e int8, same source as workload) — **note this is the workload-source chip's ridge point, not necessarily the ridge point of whatever architecture is actually being modeled in a later phase; see Phase 1c finding #1 below, it does not automatically transfer.**
-- Conclusion: fused → decisively compute-bound; unfused → decisively memory-bound. Regime is determined by the fusion (P-matrix on-chip) decision, not workload shape alone.
-- GQA's benefit is regime-dependent in two distinct ways: (1) Amdahl's-Law style — its 8× K/V byte win barely shows up in the unfused case (P-traffic dominates) but shows up fully in fused; (2) roofline-position style — in fused/compute-bound prefill, GQA's bytes savings don't move execution time at all (time is set by FLOPs, unchanged by GQA); its real prefill payoff is scratchpad pressure and KV-cache footprint, not throughput. The throughput win is expected in memory-bound decode (Phase 2).
-- Full "Key Takeaways" section logged in `notes.md` for the final writeup (Phase 1a: 7 points, Phase 1b: 17 points, Phase 1c: 4 points).
-
-## Phase 1b final hypothesis (full derivation in `notes.md`)
-
-- **PE array**: 128×128 primary (matches Trainium precedent), 128×256 carried as an explicit alternate.
-- **Dataflow**: weight-stationary, K and V as the stationary operand (driven by the 8× group-reuse factor, `num_q_heads/num_k_heads`); Q streamed. One physical array serves both QK^T and ·V because `d_head` anchors the spatial pair in both.
-- **Scratchpad** (Gemmini real default, ≤1 MiB): double-buffered K/V chunks (`tile_k`=1024) + fixed-size P tile (`tile_q×128`, fine-grained) + Q tile + output tile.
-- **Accumulator** (Gemmini real default, ≤256 KiB): per-head online-softmax tracking state (running max + running sum + partial-output accumulator, fp32) for the group of 8 heads sharing one KV head — `tile_q`=32 — plus a transient raw S/P block (`tile_q×128`, ≈16 KB).
-- **Softmax granularity: fine-grained** (per 128-wide array sub-pass, not per full `tile_k` chunk). Softmax's own ops don't touch the systolic array — need a separate vector/scalar unit; whether Gemmini has one natively or needs the host Rocket/BOOM core is an **open Phase 1d question**.
-- **Major open finding carried through 1c**: `tile_q`=32 forces Q-tile outer to K/V-chunk in the loop nest, breaking the "fetch K/V once per group" GQA reuse assumption (each chunk re-fetched ~256× instead of once) — a real, hand-predicted-in-advance tension, deliberately left for Timeloop/Gemmini to resolve rather than hand-optimized further.
-- Accumulator capacity was logged as a free sweep parameter (128 KB–512 KB, the 512 KB point grounded in a real published Gemmini "BigSP" config), not fixed at the 256 KB default.
+- **Workload**: Llama 3-70B prefill (batch=32, seq_len=8192, n_heads=64, n_kv_heads=8 GQA, d_head=128, int8), from *How to Scale Your Model*.
+- **1a**: Total FLOPs 2⁴⁶ (MHA = GQA exactly). Regime (compute- vs. memory-bound) is governed almost entirely by whether the softmax/P intermediate is fused on-chip, not by workload shape — fused is decisively compute-bound (AI 8192/14564 ≫ ridge 480.5), unfused is decisively memory-bound (AI ≈126/126.9 ≪ ridge). GQA's benefit is regime-dependent in two distinct ways (Amdahl's-Law-style, and roofline-position-style — fused prefill gets zero throughput benefit from GQA at all, since compute-bound time is set by FLOPs alone).
+- **1b**: 128×128 PE array (Trainium precedent), weight-stationary with K/V as the stationary operand (driven by GQA's 8× group-reuse), `tile_k`=1024, `tile_q`=32, fine-grained online-softmax. Major open finding: `tile_q`=32 forces Q-tile outer to K/V-chunk, breaking the "fetch K/V once per group" reuse assumption (~256× re-fetch instead of once) — deliberately left unresolved for Timeloop.
+- **1c**: Confirmed this Timeloop setup can only characterize the *unfused* regime (structural limitation, not a mapper finding). Ridge point had to be recomputed for the actual modeled architecture (≈80.08, not TPU v5e's 480.5) — AI≈126 is still compute-bound for *this* system. Dataflow sensitivity is itself regime-dependent (barely matters near an architecture's own ridge, matters a lot further above it). A single mapper run's "winner" is a local optimum, not a guaranteed ceiling.
+- **1d (deliberately scoped down** — no custom attention kernel, no real-workload-scale run, given a back-of-envelope check showed that would be genuinely multi-day for a marginal-at-best payoff): configured Gemmini at 32×32/WS-only (scaled down from the 128×128 hypothesis), validated on Farmshare via Verilator. Confirmed Gemmini has a native softmax hardware unit whose structure mirrors the online-softmax mechanism independently hand-derived in 1b. Confirmed the axis-routing assumption from 1b via Gemmini's real transposer hardware. Found that a "WS-only" config restricts behavior via a compile-time control constant, not by generating structurally smaller hardware — revising, not overturning, the 1b hardware-cost framing.
 
 ---
 
-## Phase 1c: complete — summary (full trail in `notes.md`)
+## Immediate next step: Phase 2 (decode)
 
-Ran end-to-end in a since-destroyed session (repo rename killed the chat mid-flight); Timeloop artifacts and the Docker container survived and were fully recovered, then the comparison-and-gap-explanation step was completed against Phase 1b's hypothesis. Artifacts live in `timeloop-accelergy-exercises/workspace/attention_1c/` (**separate repo/docker environment, not this one** — problem specs for QK^T and ·V as conv-style GEMMs, an architecture translating the Phase 1b hypothesis into a sweepable Timeloop model, dataflow left unconstrained at the scratchpad so the mapper had to discover K/V-stationary on its own).
+Per the spec, **before repeating 1a-1d**, think through from first principles why decode should push hardware conclusions in a *different* direction than prefill — larger effective memory-bandwidth need relative to compute, a different reuse pattern (small batch, single new token, dominated by reading the growing KV cache rather than large matmuls), possibly a different ridge-point crossover. **Write that prediction down before touching any numbers** — don't just copy Phase 1's config and assume it transfers; that assumption is exactly what Phase 2 is testing. This mirrors Phase 1a's own opening instruction, and the user has already pre-registered one piece of it directly: Phase 1a Key Takeaway #7 predicts GQA's throughput win — invisible in fused, compute-bound prefill — should show up for real in decode's memory-bound regime. Whether that prediction holds is a natural first thing to check.
 
-**Four findings, all resolved mechanistically — this is the part a fresh Phase 1d session actually needs:**
+Concrete first decisions for Phase 2a (workload characterization — still fully 🧠, not predetermined here):
+- Pick a concrete decode-phase shape (batch, KV-cache length representing an already-filled context, single new token per step) — same Llama 3-70B GQA config as a natural default for continuity with Phase 1, but this is the user's call to make and justify, not something to assume.
+- Derive FLOPs/bytes/AI/ridge-point for *this* shape from scratch — the reuse pattern is fundamentally different (no large Q·K^T/·V matmuls over a full sequence; instead, one query token attending over a long, already-materialized KV cache), so the Phase 1a formulas don't just carry over with different numbers plugged in.
 
-1. **Ridge point is a property of the specific accelerator being modeled, not a fixed workload characteristic.** QK^T hit 100% utilization even with the full *unfused* 128 GiB P-write traffic modeled — looks like it contradicts Phase 1a's "unfused should be memory-bound" prediction (AI≈126 vs. ridge 480.5), but this Timeloop architecture models a single 128×128 array at a 1 GHz base clock (not TPU v5e's 4 MXUs at 1.5 GHz) — 6× lower peak compute at the same real HBM bandwidth, so *this* architecture's own ridge point is ≈80.08, not 480.5. AI≈126 clears 80.08 — compute-bound was correct all along for this specific modeled system. **Generalizes**: any Phase 1a/1b roofline conclusion checked against a Phase 1c/1d tool result needs its ridge point recomputed for the actual modeled hardware, not reused from the workload's source chip.
-2. **How much dataflow choice matters is itself regime-dependent.** ·V's winning dataflow differed between two runs that only changed the clock/bandwidth model (v1: 1 GHz; v2: 2 GHz "int8-pumped," DRAM bandwidth held fixed in absolute bytes/s — i.e. v2's peak compute is 2× v1's, meaning v2's *own* ridge point is 2× v1's). Confirmed via the identical mapping appearing in both raw search logs: under v1 it hit 100% utilization, under v2 (same mapping, unchanged) only 80.63% — a real DMA/compute-overlap effect, not noise. Near/below an architecture's own ridge (v1), competing dataflows were essentially fungible (weight- and output-stationary tied at 100% within a rounding error); once the ridge doubled (v2), the same mapping fell behind and which dataflow "wins" started to matter far more.
-3. **A single mapper run's "winner" is not necessarily the true optimum — it's whatever a deterministic, budget-limited search finds.** Confirmed directly: rerunning `primary_v_v2`'s exact config produced a byte-for-byte identical search log and the same 80.63% answer — `random_pruned` is deterministic given a fixed config, not randomly seeded. The true 100% ceiling does exist under v2's architecture (seen in a separate, deeper, since-killed search's raw log), but escaping the 80.63% local optimum needs materially more search depth, not another attempt at the same depth — a methodology lesson for interpreting *any* Timeloop mapper result going forward, not just this one.
-4. **This Phase 1c setup cannot model "fused" at all, structurally — not a mapper/architecture finding.** Every run's DRAM traffic shows the full P round-trip (137,438,953,472 B) regardless of dataflow, because QK^T and ·V are two independent Timeloop problems with no on-chip path connecting one's output to the next's input — no mapper search, however deep, can change that. This matters because **Phase 1b's entire scratchpad/accumulator sizing exercise was designed specifically to enable fusion** — meaning Phase 1c has only ever characterized the *unfused* regime. **Decision made: not worth hacking Timeloop to fake fusion** (its problem format isn't built for modeling two matmuls with an intermediate tensor that never leaves the chip) — **real fusion validation is deferred to Phase 1d**, where a Gemmini RTL pipeline can literally keep P in scratchpad between the two matmuls, no modeling hack required. An open, not-yet-computed footnote exists for a cheap hand-projected "fused-equivalent" estimate if wanted before Phase 1d lands (subtract shared P-traffic bytes/energy from the existing unfused numbers using Phase 1a's own byte formulas).
-
----
-
-## Immediate next step: Phase 1d (Gemmini config + RTL validation)
-
-Per the spec:
-- Configure Gemmini as close as the generator allows to the Phase 1b/1c-validated config (128×128 PE array, weight-stationary K/V, 1 MiB scratchpad / 256 KiB accumulator).
-- Actually read the generated RTL — trace how the array-size/dataflow choices show up as real datapath structure.
-- Run the attention kernel (or a representative slice) through Verilator, get real cycle counts/utilization.
-- Compare against the Phase 1c Timeloop numbers, and explain every meaningful gap mechanistically — same "gap-hunting is the highest-value activity" framing that paid off four times over in Phase 1c. Findings #3 and #4 above are natural first places to check for a Timeloop-vs-RTL gap (does real Gemmini's mapper/compiler hit the same local optimum? does the real hardware pipeline actually achieve fusion, and if so what does it cost relative to Phase 1c's unfused numbers?).
-- Also still open from Phase 1b: whether Gemmini has a native vector/scalar unit for softmax, or whether it routes through the host Rocket/BOOM core (a real potential dispatch/data-movement overhead Timeloop's cost model wouldn't have captured).
+**Deliverable for Phase 2** (per spec): same structure as Phase 1 — prediction, Timeloop result, Gemmini/RTL result, gap explanation — plus an explicit comparison to Phase 1: how did the "ideal" array shape, dataflow, and scratchpad sizing differ between prefill and decode, and does that match what you'd expect from the two workloads' arithmetic intensity?
 
 ---
 
-## Where everything else lives
+## Where everything lives
 
 - `spec.md` — original project spec, all phases.
-- `notes.md` — full derivation trail for Phase 1a, 1b, and 1c, in Prediction/Log style. This is the artifact to keep appending to.
-- `timeloop-accelergy-exercises/workspace/attention_1c/` (separate repo/docker environment, not this one) — the actual Timeloop configs and run outputs referenced above.
+- `prefill_notes.md` — the complete, polished Phase 1 record (all four sub-phases, cross-phase synthesis, open threads, toolchain appendix). Reference only — nothing here should be re-derived.
+- `notes.md` — **create this fresh** for Phase 2's live derivation trail, same Prediction/Log style Phase 1 used. Refactor into `decode_notes.md` at Phase 2's natural completion point.
+- `timeloop-accelergy-exercises/workspace/attention_1c/` (separate repo/Docker environment, not this one) — Phase 1c's actual Timeloop configs/outputs. A parallel `attention_2c/`-style directory is the natural place for Phase 2's Timeloop work, for consistency.
+- Farmshare (`~/chipyard`) — same Chipyard/Gemmini checkout Phase 1d used; the `AttentionPrefillRocketConfig` config and its generated RTL are still there and are a real, working reference point for however Phase 2's Gemmini config gets built.
 - This file (`handoff.md`) — update/overwrite at the next natural pause point rather than leaving stale.
