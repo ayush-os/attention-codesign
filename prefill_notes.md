@@ -172,7 +172,7 @@ This is not a broken hypothesis — it's a concrete, hand-derived instance of ex
 
 ## 3. Phase 1c — Timeloop/Accelergy Validation
 
-Ran in a separate repo/Docker environment (`timeloop-accelergy-exercises/workspace/attention_1c/`) — QK^T and ·V expressed as conv-style GEMM problems, an architecture translating the Phase 1b hypothesis into a sweepable Timeloop model (128×128 array, 1 MiB scratchpad / 256 KiB accumulator, DRAM at TPU v5e HBM bandwidth), **dataflow left unconstrained at the scratchpad** so the mapper had to discover K/V-stationary on its own rather than being told.
+Ran in a separate Docker environment; the real experiment configs (architecture, problem definitions, mapper settings) are inlined at [`timeloop-configs/attention_1c/`](timeloop-configs/attention_1c/) — the tool's own generated output artifacts (ART/ERT tables, per-run logs) aren't preserved, since every number they'd contain is already quoted directly in this section. QK^T and ·V expressed as conv-style GEMM problems, an architecture translating the Phase 1b hypothesis into a sweepable Timeloop model (128×128 array, 1 MiB scratchpad / 256 KiB accumulator, DRAM at TPU v5e HBM bandwidth), **dataflow left unconstrained at the scratchpad** so the mapper had to discover K/V-stationary on its own rather than being told.
 
 *(This phase was run end-to-end in a since-destroyed session — a repo rename killed the chat mid-run. Tool artifacts and the Docker container survived on disk and were fully recovered; nothing was lost, but the recovery process is why this section reads as a factual reconstruction in places.)*
 

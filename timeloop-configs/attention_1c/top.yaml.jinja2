@@ -1,0 +1,24 @@
+{{add_to_path(cwd())}}
+
+globals:
+  version: 0.4
+  environment_variables:
+    TIMELOOP_HIDE_INCONSEQUENTIAL_STATS: 1
+  expression_custom_functions: []
+
+# Overridable via jinja_parse_data={"problem": "problem_qkt.yaml"} or "problem_v.yaml"
+{% set problem = problem | default('problem_qkt.yaml') %}
+problem: {{include(problem, 'problem')}}
+
+architecture: {{include(cwd() ~ '/arch.yaml', 'architecture')}}
+
+variables:
+  version: 0.4
+  technology: "45nm"
+  global_cycle_seconds: 0.5e-9  # see arch.yaml: models int8 2x-pumped rate
+
+components:
+  version: 0.4
+  classes: {{include_all('_components/*.yaml', 'compound_components.classes')}}
+
+mapper: {{include(cwd() ~ '/mapper.yaml', 'mapper')}}

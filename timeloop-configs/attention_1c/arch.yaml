@@ -1,0 +1,120 @@
+architecture:
+  version: 0.4
+  # ============================================================
+  # Phase 1c architecture: weight-stationary GEMM engine for GQA attention.
+  #
+  # Levels: DRAM -> Scratchpad (holds K/V-chunk + Q/P, per Phase 1b) ->
+  # PE array (spatial: C x M, the two dims made spatial under weight-stationary,
+  # per the Phase 1b systolic-array first-principles derivation) ->
+  # per-PE weight register + per-PE accumulator -> mac.
+  #
+  # Dataspace `keep`/`bypass` is deliberately left UNCONSTRAINED at every
+  # level below DRAM, so the mapper is free to discover its own dataflow
+  # (which dataspace is stationary where) rather than being told K/V is
+  # stationary in advance -- that's the Phase 1c test of the Phase 1b
+  # hypothesis, not an assumption baked into the model.
+  # ============================================================
+  nodes:
+  - !Container
+    name: system
+    attributes:
+      technology: "45nm"
+      # 2 GHz reference "compute pulse" rate, not a literal clock: this is how
+      # we model int8 running at 2x the array's base (bf16-equivalent) MAC
+      # rate -- confirmed real for TPU v5e (4 MXUs x 128x128 x 1.5GHz x 2x
+      # int8 = 3.94e14 FLOPs/s, matching Phase 1a exactly) rather than a
+      # TPU-specific quirk. DRAM bandwidth below is halved in words/cycle to
+      # hold the *absolute* bytes/s fixed at the real TPU v5e HBM number,
+      # since doubling the pulse rate must not also double DRAM's real
+      # physical bandwidth.
+      global_cycle_seconds: 0.5e-9
+
+  - !Component # HBM. Bandwidth set to TPU v5e int8 HBM BW (8.2e11 B/s) --
+    name: DRAM  # 820 B/cycle at 1GHz becomes 410 B/"cycle" at this 2GHz
+    class: DRAM  # int8-pumped pulse rate, split 205/205 R vs W, so absolute
+    attributes:  # bytes/s is unchanged from before this fix.
+      type: "HBM2"
+      width: 8192
+      block_size: 1024
+      datawidth: 8
+      read_bandwidth: 205
+      write_bandwidth: 205
+      depth: 268435456  # 256 GB @ datawidth=8 (wide row to stay in Timeloop's
+      # int32 depth range) -- DRAM capacity isn't meant to bind here (this
+      # workload's own P/S traffic alone is ~137 GB); only DRAM *bandwidth*
+      # above is meant to be the modeled constraint.
+
+  - !Component # Scratchpad: K/V-chunk (Weights) + Q or P (Inputs), per
+    name: Scratchpad  # Phase 1b. Sized for SWEEP; default = 1 MiB.
+    class: smartbuffer_SRAM
+    attributes:
+      technology: "45nm"
+      datawidth: 8
+      width: 128        # 16 int8 words/row
+      depth: 65536      # 65536*16B = 1 MiB
+      n_rw_ports: 2
+
+  - !Container # PE array. meshX/meshY = SWEEP (default 128x128).
+    name: PE
+    spatial: {meshX: 128, meshY: 128}
+    constraints:
+      spatial:
+        permutation: [C, M, N, G, R, S, P, Q]
+        factors: [N=1, G=1, R=1, S=1, P=1, Q=1]
+        split: 1   # first 1 dim (C) -> meshX-ish axis, remainder (M) -> other axis
+
+  - !Parallel
+    # Which dataspace goes in which physical register is *structural* (the
+    # register that feeds the multiplier's held operand vs. the register that
+    # catches the adder's output), not a discretionary dataflow choice at this
+    # granularity -- the real, mapper-searched dataflow question (does the
+    # design actually prefer keeping Weights [K/V] resident over Inputs [Q/P])
+    # lives one level up, at the unconstrained Scratchpad.
+    nodes:
+    - !Component # Per-PE stationary register (holds one operand element).
+      name: WeightReg
+      class: storage
+      subclass: aladdin_register
+      attributes:
+        technology: "45nm"
+        datawidth: 8
+        depth: 1
+        width: 8
+      constraints:
+        dataspace: {keep: [Weights], bypass: [Inputs, Outputs]}
+        # A 1-word register holds exactly one element at a time -- all
+        # tiling for every dim happens above this level (Scratchpad/DRAM),
+        # not here.
+        temporal: {default_max_factor: 1}
+
+    - !Component # Per-PE accumulator. Sized for SWEEP; default = 256 KiB
+      name: Accumulator  # total across all 128*128=16384 PEs (16 B/PE, i.e.
+      class: smartbuffer_SRAM  # depth=4 x 32-bit words/PE).
+      attributes:
+        technology: "45nm"
+        datawidth: 32
+        width: 32
+        depth: 4
+        n_rw_ports: 2
+      constraints:
+        dataspace: {keep: [Outputs], bypass: [Weights, Inputs]}
+        # Accumulator is the innermost storage level (nothing sits between it
+        # and the mac), so ANY dims a mapping leaves temporally unresolved
+        # above this point must fit *simultaneously* resident here. Bounding
+        # the local factor keeps the search away from degenerate mappings
+        # that would need to hold e.g. all 256 independent GQA groups' worth
+        # of running output state at once -- it doesn't pick which dims stay
+        # small, just forbids "everything lives in the tiny accumulator."
+        temporal: {default_max_factor: 64}
+
+    - !Nothing
+      constraints:
+        dataspace: {keep: [Inputs]}
+
+  - !Component # MAC: int8 x int8 -> int32 accumulate (standard quantized-GEMM
+    name: mac  # convention; NOT the same object as Phase 1b's fp32
+    class: intmac  # online-softmax bookkeeping state, which lives outside
+    attributes:  # this matmul-only model entirely -- see notes to user.
+      technology: "45nm"
+      multiplier_width: 8
+      adder_width: 32

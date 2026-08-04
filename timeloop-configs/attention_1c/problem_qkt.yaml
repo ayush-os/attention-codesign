@@ -1,0 +1,76 @@
+# QK^T as a GEMM expressed in Timeloop's conv-style problem shape
+# (R=S=P=Q=H=W=1 collapses the conv shape to plain matmul):
+#   C (contraction)      = d_head              = 128
+#   M (Weights free dim) = seq_len_k           = 8192   <- K, the stationary
+#                                                           operand under the
+#                                                           Phase 1b hypothesis
+#   N (Inputs/Outputs free dim, shares Weights
+#      reuse the same way a CNN batch dim does) = seq_len_q * heads_per_group
+#                                               = 8192 * 8 = 65536
+#   G (outer, independent instances -- no
+#      reuse of Weights across G)              = batch * num_kv_heads
+#                                               = 32 * 8 = 256
+# Sanity check: C*M*N*G = 2^7 * 2^13 * 2^16 * 2^8 = 2^44 MACs = 2^45 FLOPs,
+# matching Phase 1a's derived QK^T FLOPs exactly.
+problem:
+  version: 0.4
+  instance:
+    N: 65536
+    C: 128
+    H: 1
+    W: 1
+    G: 256
+    R: 1
+    S: 1
+    Hdilation: 1
+    Hstride: 1
+    Wdilation: 1
+    Wstride: 1
+    M: 8192
+    P: 1
+    Q: 1
+  shape:
+    name: qkt_gemm
+    coefficients:
+    - {name: Wstride, default: 1}
+    - {name: Hstride, default: 1}
+    - {name: Wdilation, default: 1}
+    - {name: Hdilation, default: 1}
+    data_spaces:
+    - name: Weights
+      projection:
+      - - - C
+      - - - M
+      - - - R
+      - - - S
+      - - - G
+    - name: Inputs
+      projection:
+      - - - N
+      - - - C
+      - - - R
+          - Wdilation
+        - - P
+          - Wstride
+      - - - S
+          - Hdilation
+        - - Q
+          - Hstride
+      - - - G
+    - name: Outputs
+      projection:
+      - - - N
+      - - - M
+      - - - Q
+      - - - P
+      - - - G
+      read_write: true
+    dimensions:
+    - C
+    - M
+    - R
+    - S
+    - N
+    - P
+    - Q
+    - G

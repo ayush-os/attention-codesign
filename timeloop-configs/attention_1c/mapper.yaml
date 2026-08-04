@@ -1,0 +1,9 @@
+mapper:
+  version: 0.4
+  optimization_metrics: [ edp ]
+  live_status: False
+  num_threads: 4
+  search_size: 3000
+  victory_condition: 500
+  timeout: 5000
+  algorithm: random_pruned
