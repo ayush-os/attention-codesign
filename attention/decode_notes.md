@@ -1,6 +1,6 @@
-# Decode Attention — Workload → Silicon (Phase 2, Complete Through 2b)
+# Decode Attention — Workload → Silicon (Phase 2 + Phase 3, Complete)
 
-This is the consolidated, polished record of Phase 2 (decode-phase attention, memory-leaning regime): hand-derived roofline analysis → hardware hypothesis → explicit cross-phase comparison against Phase 1's prefill hypothesis. Phase 2c (Timeloop) and 2d (Gemmini RTL) were deliberately scoped out, and Phase 3 (numerics) reframed rather than run as originally specified — all as reasoned, documented decisions rather than defaults or unfinished work (`spec.md`, "Amendment" section has the full scope reasoning). This document supersedes the working Prediction/Log-style derivation it was tracked as while the work was in progress — organized here as a finished writeup, mirroring how `prefill_notes.md` was itself refactored from a live log; self-corrections and real dependency-ordering mistakes are kept where they carried signal, pure process narration is cut.
+This is the consolidated, polished record of decode-phase attention (memory-leaning regime): Phase 2's hand-derived roofline analysis → hardware hypothesis → explicit cross-phase comparison against Phase 1's prefill hypothesis, plus Phase 3's reframed numerics question. Phase 2c (Timeloop) and 2d (Gemmini RTL) were deliberately scoped out, and Phase 4 (optional real-hardware check) skipped — all as reasoned, documented decisions rather than defaults or unfinished work (`spec.md`, "Amendment" section has the full scope reasoning). This document supersedes the working Prediction/Log-style derivations it was tracked as while the work was in progress — organized here as a finished writeup, mirroring how `prefill_notes.md` was itself refactored from a live log; self-corrections and real dependency-ordering mistakes are kept where they carried signal, pure process narration is cut.
 
 ---
 
@@ -181,23 +181,50 @@ Direct answer to the spec's own Phase 2 deliverable question: how did the "ideal
 
 ---
 
-## 4. Scope Beyond Phase 2b: 2c, 2d, 3, 4
+## 4. Phase 3 — Numerics (Reframed)
+
+Not the spec's literal version (precision-mode throughput comparison on Gemmini) — would both feel generic and hit the same Gemmini-representability wall as 2d (§2.6). Reframed question, hand-derivation only, no tool validation needed (same style as 2a/2b): **is KV-cache quantization (below int8) a bigger lever on decode's AI than GQA was?** Two direct connections motivate this rather than it being a forced addition: (a) Phase 1a explicitly flagged precision as a "carried to Phase 3" open thread (`prefill_notes.md` §1.2 — P's int8 requantization-per-round-trip tradeoff, never resolved); (b) this repo's sibling MoE project already found, for a different severely memory-bound workload, that **numerics — not routing/imbalance — was the dominant lever that actually moved the regime** (top-level `README.md`: "floor scales inversely with dispatch precision, crossover ≈2.5 bytes/element").
+
+### 4.1 The Coupled-vs-Decoupled Precision Fork
+
+**First pass — native low-precision compute**: if K/V is both stored *and* computed natively at half the bit-width (e.g. int8→int4), two things move together: workload bytes halve (AI doubles), but real hardware's peak FLOPs/s also roughly doubles for lower precision — more low-precision ALUs pack into the same silicon budget, the same mechanism behind e.g. a chip's FP8 peak throughput dwarfing its FP32 number. Ridge point (`peak FLOPs/s ÷ peak bandwidth`) doubles too. **Result: `AI/ridge` is exactly unchanged** — `(2×AI)/(2×ridge) = AI/ridge` — no matter how many precision steps down you go. A real, clean cancellation: under this model, numerics is *not* a lever on decode's regime at all, despite genuinely halving bytes moved. This is the same lesson Phase 1c already taught once (ridge point is architecture-specific, not fixed) showing up a second time as *precision*-specific, not just chip-specific.
+
+**Second pass — the realistic case, dequant-before-compute**: real KV-cache quantization decouples storage precision from compute precision — K/V is compressed for storage/bandwidth, then dequantized to a higher precision before the actual dot product (attention scores are numerically sensitive to K/V precision loss). This mirrors a pattern already present in this exact project, applied to a different tensor: Phase 1a's own precision note (`prefill_notes.md` §1.2) — on-chip softmax math runs at higher precision, but P is requantized to int8 only for the HBM round-trip. Under this decoupled model, the compute engine never leaves its baseline precision — **ridge stays fixed at 480.5**. Only bytes move, so the lever is real again, bounded only by how far storage precision can realistically go.
+
+### 4.2 Quantifying the Crossover
+
+Mirrors the MoE project's own `≈2.5 bytes/element` crossover finding. AI scales inversely with bytes/element, holding ridge fixed at 480.5. GQA's current AI ≈ 16 at 1 byte/element (int8). Solving `16 × (1/bytes_new) = 480.5` → **`bytes_new = 16/480.5 = 1/30 ≈ 0.0333 bytes/element ≈ 0.27 bits/element`.**
+
+**Verdict**: not a realistic quantization target by a wide margin — sub-1-bit-per-element isn't a standard precision format, and even the most aggressive real quantization research doesn't approach this for KV caches specifically, given their numerical sensitivity. **Decode attention has a hard, quantization-proof floor**: no realistic (or even wildly unrealistic) K/V precision choice can flip it out of the memory-bound regime.
+
+### 4.3 Cross-Project Synthesis — the Actual Portable Lesson
+
+Striking, direct contrast with the sibling MoE project: there, numerics *was* the dominant, regime-flipping lever, with a real crossover sitting in a realistic range (FP8→BF16, `≈2.5 bytes/element`). Here, the same kind of lever exists structurally (bytes genuinely halve per precision step) but is irrelevant to the regime question.
+
+**The generalizable finding, not specific to either workload**: it isn't "does a numerics lever exist" — it's **how large the roofline margin is that the lever has to close**. MoE's worst-case margin was only `~5–6.7×` (`≈21,065` vs. `≈4,208` ridge, even under imbalance, per the MoE README) — well within what a realistic ~2× byte-format swing can plausibly close. Decode's margin is `30–240×` — an order of magnitude (or two) further out than any believable precision format range could ever reach. Same mechanism, same category of lever, opposite verdict, purely a function of the margin size at the workload's starting point, nothing special about attention vs. MoE routing specifically.
+
+### 4.4 Key Findings — Phase 3
+
+1. Numerics as a lever on regime depends critically on whether compute precision is coupled to storage precision — coupled (native low-precision compute) cancels out via a matching ridge-point shift; decoupled (dequant-before-compute, the realistic case) leaves ridge fixed and the lever intact.
+2. Quantified: decode's actual crossover point (`1/30 bytes/element`) is not a realistic target by a wide margin — a clean, hard-floor finding, structurally similar in form to the MoE project's own "hard, imbalance-proof floor" language, but for precision instead of routing skew.
+3. **The portable lesson**: whether a numerics lever can flip a regime is a question about the *size of the margin it has to close*, not about whether the lever exists in principle — directly explains why the same technique was decisive for MoE and structurally irrelevant for decode, without needing any difference in mechanism between the two workloads.
+
+---
+
+## 5. Scope: Phase 2c, 2d, 4
 
 **Phase 2c (Timeloop) and 2d (Gemmini/RTL) — both skipped**, full reasoning in §2.6. 2d is structurally blocked (SIMD isn't representable in Gemmini at all). 2c's marginal value was judged low: its real payoff in Phase 1 was tool-methodology lessons already learned once and actively applied here without re-running the tool, against a workload whose conclusions are already more decisive and more thoroughly hand-explained than prefill's were.
-
-**Phase 3 (numerics) — reframed, not run as originally specified.** The spec's literal version (compare precision modes' throughput on Gemmini) would both feel generic and hit the same Gemmini-representability wall as 2d. Recommended alternative, **not yet executed**: a hand-derivation-only question, directly motivated by this project's own findings rather than the spec's generic framing — **is KV-cache quantization (below int8) a bigger lever on decode's AI than GQA was?** Two direct connections make this a natural extension rather than a forced one: (a) Phase 1a explicitly flagged precision as a "carried to Phase 3" open thread (`prefill_notes.md` §1.2 — P's int8 requantization-per-round-trip tradeoff); (b) this repo's sibling MoE project already found, for a different severely memory-bound workload, that **numerics — not routing/imbalance — was the dominant lever that actually moved the regime** (README: "floor scales inversely with dispatch precision, crossover ≈2.5 bytes/element"). Decode attention is now a second severely memory-bound, bytes-dominated workload — worth checking whether the same pattern holds, and it connects directly to real Rivos FP8/MXFP8 background rather than being a generic exercise.
 
 **Phase 4 (optional real-hardware check) — skipped.** The "does hand analysis survive contact with reality" theme was already substantively tested twice: once via Phase 1d's actual RTL/Verilator validation (a harder, more rigorous version of what Phase 4 asks for), and once via prior independent work through *How to Scale Your Model* end-to-end. A third pass is diminishing returns on an already-closed theme, and the spec marks this phase optional regardless.
 
 ---
 
-## 5. Open Threads Carried Forward
+## 6. Open Threads Carried Forward
 
 - **Per-lane reduction structure** (§2.2, §2.8): adder tree vs. serial accumulation for each lane's `d_head`-deep dot product — deliberately left unresolved, flagged as unlikely to matter given the roofline margin, not chased further.
-- **Numerics as decode's dominant lever** (§4): recommended as the real Phase 3, not yet executed. Natural next step if this project continues.
 - **SRAM-only / no-HBM architectures** (Groq, Cerebras precedent) — flagged mid-derivation as a real, legitimate direction, explicitly out of scope for Gemmini/Timeloop's HBM-based architecture template (same category of tool-representability gap as §2.6). Kept as a footnote for "what I'd explore next" rather than chased further; would need its own ridge-point recomputation under SRAM-scale bandwidth.
 - **Sparse/linear attention** — flagged as the natural "next lever after GQA" once GQA became decode's *only* available lever within SDPA (§1.5, Key Finding #6) — explicitly out of scope, a boundary condition worth naming rather than pursuing here.
 
 ---
 
-This document covers Phase 2 through the hardware hypothesis (2a, 2b) and the explicit cross-phase comparison the spec's Phase 2 deliverable calls for, with 2c/2d/3/4 treated as deliberate, reasoned scope decisions rather than unfinished work.
+This document covers Phase 2 (2a, 2b, the explicit cross-phase comparison the spec's Phase 2 deliverable calls for) and Phase 3 (numerics, reframed) in full, with 2c/2d/4 treated as deliberate, reasoned scope decisions rather than unfinished work.
