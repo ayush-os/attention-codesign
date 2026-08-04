@@ -102,3 +102,16 @@ If you're moving faster than expected, spend the slack going deeper on gap expla
 
 ## Fallback / Minimum Viable Version
 If time gets eaten (MTIA work, life, etc.): Phase 1 alone (prefill, full loop, written up) is still a complete, defensible artifact. Decode, numerics, and real-hardware validation are additive, not required.
+
+---
+
+## Amendment — Actual Scope Executed for Phase 2 (post-2b)
+
+Decided after completing Phase 2a/2b (decode workload characterization + hardware hypothesis), full reasoning in `decode_notes.md` §2.6/§4:
+
+- **Phase 2c (Timeloop) — skipped.** Its real payoff in Phase 1 was tool-methodology lessons (architecture-specific ridge points, mapper local-optima, tool-representability limits) already learned once and actively applied to Phase 2 without re-running the tool — against a decode workload whose conclusions are already more decisive (~240×/~30× below ridge) and more thoroughly hand-explained than prefill's were.
+- **Phase 2d (Gemmini/RTL) — skipped, structurally.** Verified directly against Gemmini's source that it has no general-purpose SIMD/vector compute path — only a systolic array. Phase 2b's hardware hypothesis (SIMD-based, required by the fill/drain analysis in `decode_notes.md` §2.1) is not representable by this toolchain at all, a harder gap than Phase 1c's fusion-modeling limitation.
+- **Phase 3 (numerics) — reframed, not run as originally specified.** The spec's literal version (precision-mode throughput comparison on Gemmini) both feels generic and hits the same Gemmini-representability wall as 2d. Recommended alternative: a hand-derivation-only question — is KV-cache quantization (below int8) a bigger lever on decode's AI than GQA was? — directly motivated by Phase 1a's own "carried to Phase 3" precision thread and by this repo's sibling MoE project finding that numerics, not imbalance, was the dominant lever for a comparably memory-bound workload. Not yet executed.
+- **Phase 4 (optional real-hardware check) — skipped.** The "does hand analysis survive contact with reality" theme was already substantively tested via Phase 1d's real RTL/Verilator validation and via prior independent work through *How to Scale Your Model* end-to-end — a third pass would be diminishing returns on an already-closed theme, and the spec marks this phase optional regardless.
+
+This mirrors the project's own "Fallback / Minimum Viable Version" logic above, extended one phase further: Phase 2a/2b plus the explicit cross-phase hardware comparison is treated as a complete, defensible stopping point for Phase 2, with the reasoning for stopping there stated rather than left implicit.
