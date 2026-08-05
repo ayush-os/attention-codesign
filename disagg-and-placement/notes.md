@@ -1107,3 +1107,68 @@ numbers in the write-up — "MoE moves fewer bytes than dense at this batch
 size" is true but for a much less interesting reason than "sparse routing
 saves bandwidth."
 
+### 2b.7 N=320 itself wasn't grounded for DeepSeek-V2 — corrected to N=640
+
+**Caught before pulling FLOPs numbers from `moe-routing-notes.md`**: those
+numbers (`F_shared,device`, `F_routed,device`) were computed at **T=8,192**,
+project #3's own system-wide batch — not this project's N=320. Checking why
+T=8,192 was chosen surfaced two separate problems, not one:
+
+1. **T=8,192 itself isn't grounded for DeepSeek-V2's capacity.**
+   `moe-routing-notes.md` line 39 states plainly that `seq_len=8,192` was
+   *"reused from the attention project [Llama-3-70B] for cross-project
+   comparability; not a first-order lever for MoE comms"* — valid for
+   comms-volume purposes (dispatch is per-token, seq_len-independent), but
+   T=8,192's own derivation (`max local batch @ seq_len=8,192 ≈ 1,893`) *does*
+   depend on seq_len as a real, load-bearing term. It silently inherited a
+   borrowed number for a calculation that needed a real one.
+2. **DeepSeek-V2's real context length, checked via HF config
+   (`deepseek-ai/DeepSeek-V2/config.json`)**: base/pretrained
+   `original_max_position_embeddings=4,096`; real shipped/served
+   `max_position_embeddings=163,840` (YaRN RoPE scaling, `rope_theta=10000`,
+   factor 40 — a real deployed capability, not hypothetical). Neither number
+   is 8,192.
+
+**Regrounded, matching Phase 1 §1.5's exact methodology** (native/shipped max
+context as the worst-case-safe per-request cap — same choice, same
+reasoning, different model's real number): **cap = 163,840**. Also switched
+the reserve from project #3's 46% ("activations/router/framework overhead")
+to this project's own **10–15% PagedAttention-fragmentation convention**
+(§1.3/1.4) — the 46% figure was never consistent with this project's own
+finding that activations don't consume HBM under the fused execution model,
+so reusing it would import an unrelated project's margin philosophy instead
+of this project's own.
+
+| Reserve | Usable KV/device | Max tokens/device | N/device | T (system-wide, ×8) |
+|---|---|---|---|---|
+| 10% | 241.155 GB | 13,955,729 | 85 | 680 |
+| 15% | 227.757 GB | 13,180,411 | 80 | **640** |
+
+**Picked N=640** (15% reserve) — the more conservative of the two, matching
+which end of the 320-vs-339 spread dense itself picked in §1.5.
+
+**Recomputed at N=640**: global touched = 161.00/162 (99.38%); per-device =
+21.875/22 (99.43%); **per-device bytes/layer = 258.05 MB** (0.73× dense,
+down slightly from §2b.5/2b.6's N=320 figures of 247.0 MB/0.70×, but the
+qualitative picture is essentially unchanged — still comfortably past
+§2b.2's N≈232 saturation point regardless of which of the three N values
+(320, 640, or the discredited 8,192) gets used).
+
+**§2b.6's decomposition, updated — the "sparsity is barely doing anything"
+finding gets *stronger*, not weaker**: at N=640 the sharding-topology floor
+(259.5 MB, N-independent) vs. actual (258.05 MB) gap shrinks to just
+**0.41 percentage points of dense (0.56% of the floor, 1.45 MB)** — down
+from 3.55pp/4.8% at the old N=320. Makes sense mechanically: N=640 is
+further past the N≈232 saturation point than N=320 was, so there's even
+less unsaturated selectivity left for routing sparsity to exploit. **At
+this project's real, properly-grounded batch size, essentially the entire
+"MoE beats dense's bytes-moved number" result is the sharding-topology
+floor — routing sparsity itself is nearly irrelevant to the answer.**
+
+**N=640 is the number to carry into the regime-crossover check next**, not
+320 or 8,192. `moe-routing-notes.md`'s `F_shared,device`/`F_routed,device`
+FLOPs figures still can't be pulled at face value (computed at T=8,192) —
+need recomputing at T=640 using the same formula shape
+(`F_shared,device=(T/8)×2×F_expert`, `F_routed,device=(T/8)×6×F_expert`,
+uniform/baseline, no imbalance multiplier per the earlier consistency call).
+
