@@ -1491,3 +1491,35 @@ sequences, batch=32/8 devices under data-parallel attention) throughput =
 per-token FFN compute (§2b.3b) dominating once solidly in compute-bound
 territory.
 
+### 2b.16 Final MoE chip-ratio hypothesis — spec_v2 item 6 answered
+
+**`601.55/457.98 ≈ 1.31`** → **~1.31 prefill chips per decode chip** — vs.
+dense's corrected **~5.82:1** (§2.9). Not a small shift, and not just
+magnitude — a genuinely different *shape* of result.
+
+**Mechanism, both sides pushing the same direction**:
+- **Dense's high ratio is almost entirely a decode-batching artifact**:
+  N=320 pushed dense's FFN into compute-bound territory, a real 6.6×
+  throughput jump (§2.5) that prefill never gets an equivalent version of
+  (batch=32 inherited, never re-derived, §2.8). One phase got dramatically
+  faster, the other didn't — steep imbalance, many prefill chips needed to
+  keep up with one fast decode chip.
+- **MoE can't access that same decode speedup at realistic capacity**: its
+  own FFN crossover sits at N≈807/device (§2b.9), but real HBM-capacity
+  constraints only support N≈80/device (§2b.7) — an order of magnitude
+  short. MoE decode stays solidly memory-bound, no comparable batching
+  payoff.
+- **MoE's prefill is independently cheaper per chip**, because sparse
+  routing's ~3.73×-lower per-token FFN compute (§2b.3b) pays off directly
+  once prefill's large batch is deep in compute-bound territory (§2b.15).
+
+**Both effects move the ratio the same way**: decode loses the dramatic
+speed advantage that drove dense's imbalance, prefill gains a real one —
+collapsing the ratio from dense's steep prefill-skew toward near-balance.
+**Direct, mechanistically-grounded answer to spec_v2's central question**
+("does disaggregation work the same way once you're serving MoE"): no —
+not just a different number, a different *reason* for the number. Dense's
+disaggregation story is fundamentally about decode's batching windfall;
+MoE's is about sparsity cutting prefill's cost while decode's own windfall
+stays structurally out of reach at real capacity.
+
