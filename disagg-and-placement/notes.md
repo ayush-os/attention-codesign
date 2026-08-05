@@ -432,3 +432,234 @@ placement/eviction question this project asks from here on is about KV
 cache, never about weights.
 
 ---
+
+## Phase 2 — Disaggregation hypothesis (chip ratio)
+
+### 2.1 Reframing: service time, not the compute/memory-bound label itself
+
+Initial instinct was to derive the chip ratio directly from the prefill/decode
+roofline *labels* (compute-bound vs. memory-bound) carried over from the
+attention project. Caught before computing anything: the label alone doesn't
+determine a throughput ratio — DistServe's own approach (Phase 0 reading)
+profiles each phase's actual goodput independently and solves an allocation,
+no closed form from the regime label. What roofline *does* supply is the
+ingredient that turns FLOPs/bytes into **service time**: `time =
+max(FLOPs/peak_compute, bytes/peak_bandwidth)`. Regime is real but one level
+removed — the actual lever is service time → throughput per chip → chip
+ratio.
+
+### 2.2 Attention service time — reused from the sibling project, converted to this project's chip/precision
+
+Reused `prefill_notes.md`/`decode_notes.md`'s own FLOPs and bytes formulas
+(GQA, the real Llama-3-70B config used throughout this repo) rather than
+re-deriving from scratch. Converted from their int8/TPU v5e basis to this
+project's FP4/TPU 8i basis: FLOPs are precision-invariant (same MAC count);
+bytes at FP4 = int8 bytes ÷ 2. TPU 8i FP4 specs used throughout: peak =
+10.1×10¹⁵ FLOPs/s, HBM BW = 8.6×10¹² B/s (ridge point = 1,174.4 FLOPs/byte).
+
+**Batch scaling — confirmed exact, not assumed**: `decode_notes.md` §1.2
+states explicitly that batch is inert for SDPA's own AI ("every batch element
+carries a distinct KV cache — no cross-batch reuse — so FLOPs and bytes
+scale together, linearly, with batch"). Checked the consequence directly:
+since `service_time ∝ batch` and `throughput = batch/service_time`,
+**attention's aggregate throughput per chip is invariant to batch size** —
+the batch/N question that Phase 1 left open (320 vs. 339 vs. ~4,558) turned
+out to be moot for attention's own throughput number. (Turned out **not** to
+hold for FFN — see §2.5.)
+
+### 2.3 Two real-workload corrections to the reused numbers
+
+Both `prefill_notes.md`/`decode_notes.md` numbers were derived for the
+attention project's own fixed workload (`seq_len=8192` throughout) — not
+automatically valid for this project's own request-shape model (Phase 0:
+DistServe-anchored, ~512 avg prompt / ~64 avg output tokens). Two corrections
+made, not silently:
+
+- **Prefill seq_len: 512, not 8192.** Prefill FLOPs scale as `seq_len²`;
+  bytes scale as `seq_len` — so this isn't a minor rescale (`(512/8192)² =
+  1/256` on FLOPs alone). Recomputed at seq_len=512, GQA, batch=32, fused,
+  FP4: **FLOPs = 2³⁸ ≈ 2.749×10¹¹, bytes = 150,994,944 B**. Real finding: at
+  this realistic prompt length, prefill is only **marginally compute-bound
+  (~1.55× margin)** — a much closer call than the confidently-compute-bound
+  picture (~17–25×) the sibling project found at seq_len=8192. AI scales
+  linearly with seq_len, so shrinking the prompt shrinks the margin, not just
+  the absolute time.
+- **Decode context length: 544, not 8192.** `seq_len_kv=8192` in the sibling
+  project was Llama-3's native max-context cap, not an average. Since
+  decode's context grows by 1 token/step across the generation (512 → 576,
+  using Phase 0's averages), and bytes/step scale **linearly** in context
+  length, the time-averaged context across a request's decode phase is
+  exactly `avg_prompt_len + avg_output_len/2 = 512 + 32 = 544` (arithmetic
+  mean of a linear trajectory's endpoints). At FP4, batch=32, seq_len_kv=544,
+  GQA: **FLOPs = 570,425,344, bytes = 18,087,936 B**. *Flagged, not fully
+  resolved*: this uses the lognormal request-shape model's mean as a point
+  estimate, not the full distribution — since throughput is inversely
+  proportional to context length, the true distributional average
+  (harmonic-mean-flavored) isn't identical to throughput-at-the-mean. Treated
+  as a defensible approximation, consistent with this project's existing
+  precedent of flagging rather than fully resolving the lognormal choice
+  itself.
+
+**N (concurrent decode requests) — two decisions, different weight given to
+each:**
+- 320 vs. 339 (Phase 1's 15%/10% fragmentation-reserve split, only a ~6%
+  spread): judged as noise, picked **N=320**.
+- 320 vs. **~4,558** (hard-cap vs. average-case dynamic admission, a **~14×
+  spread** — Phase 1 §1.5's real open fork): judged load-bearing enough to
+  carry both forward as scenarios rather than collapsing now, mirroring this
+  repo's own precedent (computing both fused/unfused, both MHA/GQA, rather
+  than picking one early). **Only N=320 has actually been run through the
+  ratio below — the ~4,558 scenario is still open, not yet computed.**
+
+### 2.4 The FFN gap — a first-order omission, not a rounding error
+
+Both `prefill_notes.md`/`decode_notes.md` are explicitly SDPA-only (§0 of
+each: "not the surrounding QKVO/FFN projection weights"). Neither sibling
+project ever derived FFN compute for Llama-3-70B — the MoE project's own FFN
+formula is for **DeepSeek-V2** (sparse MoE, `d_model=5,120`/`d_ff=1,536`, only
+8-of-162 experts active/token) — architecturally wrong model, wrong dims,
+wrong sparsity for Llama-3-70B (dense, every token through one full
+FFN/layer). The formula shape (`3×2×d_model×d_ff` per token, SwiGLU)
+transfers; the dims don't.
+
+Sourced Llama-3-70B's real FFN dims directly (matching this project's own
+practice of pulling `n_layers=80` from HF config rather than assuming):
+**`d_ff` (intermediate_size) = 28,672**, `hidden_act = silu` — confirming
+SwiGLU is the real architecture, not a simplifying assumption, via
+`unsloth/Llama-3.3-70B-Instruct`'s config (WebFetch), independently
+cross-confirmed against a *How to Scale Your Model*-style hyperparameter
+table the user supplied directly (identical values: `n_layers=80,
+d_model=8192, d_ff=28672, n_heads=64, n_kv_heads=8, d_head=128`; also
+surfaced `n_embeddings (vocab) = 128,256`, uncounted anywhere — flagged as an
+open gap, see §2.7).
+
+**FFN per token/layer**: FLOPs = `3×2×8,192×28,672` = **1,409,286,144**.
+Weight bytes/layer (FP4, weight-stationary/fused — same idealization
+attention used for K/V) = `3×8,192×28,672×0.5` = **352,321,536 B**,
+batch-invariant (loaded once, amortized across every token in the batch —
+the mechanism that turned out to matter, §2.5).
+
+### 2.5 First combined result (batch=32 throughout) — looked backwards, investigated, resolved
+
+**Combined (attention+FFN) per-layer service time, batch=32 both pools:**
+
+| | Prefill (seq_len=512) | Decode (seq_len_kv=544) |
+|---|---|---|
+| Attention service | 27.22 µs (CB, 1.55×) | 2.103 µs (MB, 37.2×) |
+| FFN service | 2,286.1 µs (CB, 40.4×) | 41.00 µs (MB, 9.18×) |
+| Combined/layer | 2,313.3 µs | 43.10 µs |
+| × 80 layers | **185.07 ms** | **3.448 ms** |
+| Throughput/chip | 32/0.18507s ≈ **172.9 req/s** | (32/0.0034483s)/64 ≈ **145.0 req/s** |
+
+FFN dominates both phases (~99% prefill, ~95% decode) — attention alone was a
+rounding error, explaining why the earlier attention-only ratio (0.0136, ~73
+decode chips per prefill chip) was so obviously broken.
+
+**Ratio at batch=32: `decode_tput/prefill_tput = 145.0/172.9 ≈ 0.84`** — i.e.
+needing *more* decode chips than prefill chips. Backwards from DistServe's
+own reported direction ("more prefill instances per decode instance is
+normal"). Investigated rather than accepted or hand-waved as "different
+model."
+
+**Root cause, confirmed mechanistically**: FFN weight bytes are
+batch-invariant (§2.4) — using batch=32 for decode's FFN badly
+under-amortized the fixed 352 MB weight load, when this project's own Phase 1
+had already derived a realistic decode concurrency ceiling an order of
+magnitude higher (N≈320–339). Attention has no such batching payoff (bytes
+scale linearly with batch, confirmed §2.2) — so the batch=32 default, correct
+for attention, was silently wrong for FFN.
+
+**Recomputed decode at N=320:**
+
+| | Attention (N=320) | FFN (N=320) |
+|---|---|---|
+| FLOPs | 5,704,253,440 | 450,971,566,080 |
+| Bytes (FP4) | 180,879,360 | 354,942,976 |
+| Compute time | 0.5648 µs | 44.65 µs |
+| Memory time | 21.03 µs | 41.27 µs |
+| Service | 21.03 µs (MB, 37.2× — unchanged, confirms attention's batch-invariant AI) | **44.65 µs (CB, ~1.08× — crosses regime)** |
+
+FFN's decode regime **flips from memory-bound (9.2× at N=32) to marginally
+compute-bound (~1.08× at N=320)** — exact crossover solved at **N≈296**,
+landing right inside the 320–339 range already chosen for unrelated reasons.
+Confirmed N=320 vs. 339 still doesn't matter post-FFN (token throughput
+60,904 vs. 60,900 tok/s — effectively identical, both past the crossover).
+
+**Corrected decode**: combined/layer = 21.03+44.65 = 65.68 µs; ×80 layers =
+**5.254 ms**; token throughput = 320/5.254ms ≈ 60,904 tok/s; request
+throughput (÷64) ≈ **951.6 req/s/chip** — a **6.6× jump** from the batch=32
+figure.
+
+**Corrected ratio: `951.6/172.9 ≈ 5.50`** → **~5.5 prefill chips per decode
+chip** — matches DistServe's directional finding.
+
+**Ruled out, explicitly**: the "different model" hypothesis (Llama-3-70B/GQA
+vs. DistServe's OPT-175B/plain-MHA) as the primary explanation. Checked
+directly: GQA's ~8× K/V fetch reduction would, if anything, make *this*
+project's decode cheaper/faster relative to an OPT-175B comparison — pushing
+toward needing *fewer* decode chips, i.e. the same direction as the
+already-backwards batch=32 result, not toward resolving it. The
+batch-size/FFN-amortization gap is the real, load-bearing explanation — a
+genuine correctness catch in this project's own numbers, not an
+apples-to-oranges artifact.
+
+### 2.6 Final chip-ratio hypothesis (as of this phase)
+
+**~5.5 prefill chips per decode chip**, derived from attention+FFN combined
+service time on TPU 8i/FP4, at this project's own real workload parameters
+(seq_len=512 prompt, seq_len_kv=544 average context, N=320 decode
+concurrency, DistServe-anchored 512-in/64-out request shape). Matches
+DistServe's own reported direction (more prefill instances needed) after the
+FFN correction — not a forced match, a mechanistically-explained convergence.
+
+### 2.7 Key Findings — Phase 2 (chip ratio)
+
+1. **Regime label ≠ ratio driver.** Compute/memory-bound tells you which term
+   sets service time; the ratio itself needs service time → throughput →
+   chip count, exactly DistServe's own no-closed-form approach.
+2. **Batch invariance is lever-specific, not universal.** Attention's AI is
+   batch-invariant (no cross-request reuse); FFN's is not (weight bytes are
+   batch-invariant, which is the opposite property, and the one that
+   actually matters for chip provisioning).
+3. **Reused numbers need reused-workload verification, not just
+   reused-formula verification.** Two real mismatches surfaced (prefill
+   seq_len, decode context length) purely from checking whether the sibling
+   projects' *fixed workload* matched this project's own *request-shape
+   model* — same category of gap both times.
+4. **The FFN omission was the dominant source of the "backwards" ratio, not
+   model choice.** Attention alone was <1–5% of either phase's real service
+   time — validating attention-only would have validated the wrong thing.
+5. **A "boring" match with DistServe's direction after a real correction is a
+   stronger result than an unexplained match would have been** — the
+   ~5.5:1 ratio wasn't tuned to match DistServe; it fell out of fixing a
+   genuine mechanistic gap (FFN batch-amortization), and happened to land in
+   the expected direction.
+
+### 2.8 Open threads carried forward
+
+- **KV-handoff mechanism** (spec's other Phase 2 ask — transfer cost,
+  interconnect fabric) — not yet started. This section only covers the
+  chip-ratio half of Phase 2.
+- **N≈320 vs. N≈4,558 (hard-cap vs. average-case admission)** — only N=320
+  has been run through the ratio; the ~14× scenario is still open, per §2.3.
+- **Prefill's own batch=32 never reconsidered upward** — decode's N=320 came
+  from Phase 1's derived HBM-capacity ceiling; no equivalent "prefill
+  capacity" derivation exists in this project to justify raising prefill's
+  batch the same way. Left at the attention project's inherited default, not
+  because it's necessarily right, but because there's no derived alternative
+  yet.
+- **Vocab/LM-head matmul (`n_embeddings=128,256`)** — surfaced via the user's
+  hyperparameter-table screenshot, never counted anywhere in either sibling
+  project or here. Likely small relative to FFN (`d_model × vocab` once per
+  token, not once per layer) but not verified.
+- **FFN's "fused" SwiGLU intermediate treated as an assumption, not
+  stress-tested** — mirrors attention's own fused/unfused split
+  (`prefill_notes.md` §1.2), but unlike attention, never checked against
+  SRAM capacity or an unfused alternative. If FFN's gate/up intermediate
+  (`d_ff` elements/token) had to round-trip HBM instead of staying on-chip,
+  this would materially change the FFN bytes-moved number.
+- **Lognormal mean used as a point estimate for decode's average context
+  length (544)** — flagged, not resolved via full distributional integration
+  (§2.3).
+
+---
