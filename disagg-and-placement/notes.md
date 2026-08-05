@@ -1172,3 +1172,63 @@ need recomputing at T=640 using the same formula shape
 (`F_shared,device=(T/8)×2×F_expert`, `F_routed,device=(T/8)×6×F_expert`,
 uniform/baseline, no imbalance multiplier per the earlier consistency call).
 
+### 2b.8 MLA decode attention FLOPs — derived fresh, not reusable from either sibling project
+
+**Why this couldn't be reused**: neither the vanilla GQA formula
+(`batch×heads×seq_q×d_head×seq_k×2`, used throughout `prefill_notes.md`/
+`decode_notes.md` for Llama-3-70B) nor anything in `moe-routing-notes.md`
+(which only sized MLA's weight/KV-cache *footprint*, never its decode-step
+*compute*) applies here. DeepSeek-V2 uses MLA, architecturally different
+from vanilla MHA/GQA — confirmed by pulling the real equations from the
+primary source (arXiv 2405.04434 §2.1, eq. 9–19, via the paper's HTML
+rendering) rather than assuming the sibling projects' formula transfers.
+
+**Real MLA equations** (`d=5,120`, `d_c=512`, `d_c'=1,536`, `d_h=128`,
+`d_h^R=64`, `n_h=128`):
+- Down-projections: `c_t^KV=W^DKV·h_t` (d→d_c, cached), `c_t^Q=W^DQ·h_t`
+  (d→d_c')
+- Up-projections: `k_t^C=W^UK·c_t^KV`, `v_t^C=W^UV·c_t^KV`,
+  `q_t^C=W^UQ·c_t^Q` (all d_c or d_c' → n_h·d_h)
+- Decoupled RoPE: `k_t^R=RoPE(W^KR·h_t)` (from h_t directly, shared across
+  heads), `q_t^R=RoPE(W^QR·c_t^Q)` (per-head)
+- Per-head dim used in the score dot product: `d_h+d_h^R=192`
+- **Absorption (paper §2.1.2, stated directly, not inferred)**: *"since
+  W^UK can be absorbed into W^Q, and W^UV can be absorbed into W^O, we even
+  do not need to compute keys and values out for attention."* This is the
+  real deployed inference path — modeling the naive (non-absorbed) version
+  would mean re-expanding every cached position's compressed latent back to
+  full per-head K/V at *every* decode step, a huge and unrealistic
+  `seq_len_k`-scaling cost no real system would actually pay, given only
+  the compressed latent is cached.
+
+**FLOPs, absorbed formulation, derived here** (not stated by the paper —
+it describes the technique in prose, not a FLOPs count):
+
+| Component | MACs | Scales with seq_len_k? |
+|---|---|---|
+| `c_t^Q`, `c_t^KV`, `k_t^R`, `q_t^R` (down-proj + RoPE) | 23,396,352 | No |
+| Absorbed query (`W^UK^T·W^UQ` per head, applied to `c_t^Q`) | 100,663,296 | No |
+| Output up-projection + `W^O` (unfused) | 92,274,688 | No |
+| **Fixed/token total** | **216,334,336 MACs = 432.67M FLOPs** | — |
+| Content score + RoPE score + weighted sum (latent-space, per position) | 139,264 | Yes |
+| **Per-position total** | **139,264 MACs = 278,528 FLOPs** | — |
+
+**Judgment call, flagged explicitly**: computed the output side *unfused*
+(up-project the latent-weighted-sum per head, `d_c→d_h`, then apply `W^O`
+separately: 92.3M MACs) rather than literally fusing `W^UV` into `W^O` as
+one precomputed matrix (which checks out to 335.5M MACs — *more* expensive,
+since factoring through the smaller intermediate dimension `d_h=128` beats
+a single larger matrix). The paper's prose describes the technique, not
+which factoring is FLOPs-optimal — used the cheaper decomposition since
+that's what a real efficient kernel would do.
+
+**Formula**: `FLOPs/token/layer = 432.67M + seq_len_k × 278,528`. At N=640's
+context (§2b.7): **≈611.0M FLOPs/token/layer**. Structurally different from
+vanilla GQA — MLA carries a large *fixed* per-token overhead (dominated by
+the absorbed-query and output-projection terms) plus a much shallower
+per-position slope, vs. vanilla's no-fixed-term, steeper-slope shape.
+
+**Next**: combine with FFN FLOPs (recomputed at T=640, uniform baseline,
+per the consistency call in §2b.7) to get full per-device decode service
+time and run the regime-crossover check.
+
