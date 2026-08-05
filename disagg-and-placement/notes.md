@@ -772,3 +772,52 @@ selection frequency generally (default assumption for hot-key access
 patterns in caching/DB literature), and calibrates smoothly to the one real
 sourced number available (Gini≈0.70) without a second free parameter.
 
+### 2b.2 Expected distinct experts touched as a function of batch size N
+
+**Formula, exact given marginal probabilities**: `E[distinct] = 2 +
+Σᵢ₌₁¹⁶⁰ [1 − (1−qᵢ)^N]`, where `qᵢ` = probability a single token touches
+routed expert *i*, and the 2 shared experts are always touched
+(deterministic, added outside the sum). Holds exactly regardless of the
+M≤3-device-limited joint selection mechanics inside one token's own routing
+— by linearity of expectation, expected distinct count only depends on each
+expert's *marginal* per-token touch probability, not on how a token's 6
+picks are jointly correlated with each other. Requires token routing
+decisions independent *across* tokens (reasonable: unrelated requests).
+
+**qᵢ, the one approximated piece**: `qᵢ = 1 − (1−pᵢ)⁶` — treats the 6 routed
+slots as independent with-replacement draws from the Zipf weights `pᵢ`
+(§2b.1), rather than modeling the real without-replacement top-6 selection
+exactly (which has no clean closed form here — would need a Plackett-Luce-
+style sequential-removal computation). **Flagged, not resolved**: with-
+replacement duplicate draws can waste a slot re-picking an already-likely
+expert, understating true single-token inclusion probability for the most
+popular experts vs. real without-replacement selection — i.e. this
+approximation is a conservative *underestimate* of coverage; the true curve
+likely saturates even faster than reported below.
+
+**Computed** (`s=1.076` from §2b.1, `n_routed=160`):
+
+| N | E[distinct experts] | % of 162-expert table |
+|---|---|---|
+| 1 | 7.2 | 4.4% |
+| 32 (dense's inherited default batch) | 66.4 | 41.0% |
+| 100 | 114.3 | 70.5% |
+| 296 (dense's own FFN crossover N, §2.5) | 151.9 | 93.8% |
+| **320 (this project's own decode-N, §1.5)** | **153.5** | **94.7%** |
+| 1,000 | 161.9 | 99.9% |
+| ≥4,558 | 162.0 | 100.0% |
+
+**Finding: coverage saturates fast, well before realistic decode
+concurrency.** By N=320 — the same decode-concurrency figure already derived
+in Phase 1 and reused throughout Phase 2a — the batch already touches 94.7%
+of the full 162-expert table. Real amortization headroom exists at small N
+(32 tokens touches only 41% of the table), but it's almost entirely spent by
+the time batch size reaches this project's own realistic decode-N. This
+points decisively toward spec_v2's **high-diversity limit**, not the
+low-diversity one: at N=320+, expert-table cost is already close to its
+ceiling, the opposite of dense's story (where more N kept buying more
+amortization all the way to its own crossover at N≈296). Next step (spec_v2
+item 2): convert this distinct-count curve into effective FFN bytes moved
+per decode step as a function of N, to see how close "94.7% of the table"
+actually lands to dense's flat 352 MB/step baseline.
+
