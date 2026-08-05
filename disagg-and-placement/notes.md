@@ -748,3 +748,27 @@ affected term's variable share of the total.
 
 ---
 
+## Phase 2b — MoE chip ratio
+
+### 2b.1 Per-expert selection-probability distribution — Zipf, calibrated to Gini≈0.70
+
+Checked `moe-routing-notes.md` for a reusable per-expert selection-probability
+model before inventing one (same discipline as reusing formulas elsewhere in
+this project) — confirmed it doesn't have one. §2.2's Gini≈0.70/~3.3×
+multiplier is a **device-level** load-imbalance magnitude, not a distribution
+over the 162 individual experts; nothing there answers "expert *i* gets
+picked with probability p_i." Genuinely new for this phase.
+
+**Delegated choice** (user: pick one, not worth deliberating): **Zipf
+distribution**, `p_i ∝ 1/i^s` over the 162 experts, exponent `s` solved
+numerically so the resulting Gini coefficient matches ≈0.70.
+
+**Why Zipf over a two-tier hot/cold split**: `moe-routing-notes.md` §2.2
+already rejected a Pareto-by-analogy shape once for lack of MoE-specific
+evidence. A bimodal hot/cold split has the identical problem — it requires
+inventing an arbitrary hot-expert-count cutoff with nothing to source it.
+Zipf is single-parameter, standard for modeling skewed discrete/categorical
+selection frequency generally (default assumption for hot-key access
+patterns in caching/DB literature), and calibrates smoothly to the one real
+sourced number available (Gini≈0.70) without a second free parameter.
+
