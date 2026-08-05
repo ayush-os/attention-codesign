@@ -1453,3 +1453,41 @@ comfortably past that, so the same **259.5MB/device ceiling from
 §2b.5/§2b.7 carries over directly**, no fresh distinct-experts-touched
 derivation needed.
 
+### 2b.15 Prefill regime and throughput
+
+**Combining methodology, confirmed consistent with dense §2.5 and MoE
+decode §2b.9** (not the alternative "sum all FLOPs, sum all bytes, one
+global max" — checked and rejected: `max(a,b)+max(c,d) ≥ max(a+c,b+d)`
+always, so that alternative would silently assume cross-stage compute/
+memory overlap never assumed anywhere else in this project). Each stage
+gets its own `max(compute,memory)`, then the two service times sum.
+
+**Attention memory time**: weight bytes only (8 MLA matrices, **replicated**
+per device under data-parallel attention, not sharded — 149,225,472 params
+× 0.5B = 74.61MB/device, weight-stationary). No separate activation-traffic
+term — core attention treated as fused/on-chip, matching
+`prefill_notes.md`'s own fused-prefill convention (P/intermediate
+activations never touch HBM).
+
+| | Attention (naive) | FFN |
+|---|---|---|
+| FLOPs/device | 697,126,879,232 | 773,094,113,280 |
+| Bytes/device | 74.61 MB | 259.5 MB |
+| Compute time | 69.022 µs | 76.544 µs |
+| Memory time | 8.676 µs | 30.174 µs |
+| **Regime** | **Compute-bound, 7.96×** | **Compute-bound, 2.54×** |
+| Service | 69.022 µs | 76.544 µs |
+
+**Both compute-bound — a genuine validation of §2b.9's crossover finding**:
+FFN's compute-bound crossover was derived there as N≈807/device; prefill's
+2,048 tokens/device sits well past it, and indeed FFN flips compute-bound
+here (2.54×) the way §2b.9 predicted it would at large enough N. The whole
+derivation chain hangs together.
+
+**Combined/layer = 145.566µs; ×60 layers = 8.734ms**; per-device (=4
+sequences, batch=32/8 devices under data-parallel attention) throughput =
+**457.98 req/s/chip** — **~3.2× faster than dense's corrected prefill**
+(142.70 req/s/chip, §2.9), almost certainly driven by MoE's ~3.73×-cheaper
+per-token FFN compute (§2b.3b) dominating once solidly in compute-bound
+territory.
+
