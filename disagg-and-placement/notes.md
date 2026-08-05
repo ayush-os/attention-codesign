@@ -1346,3 +1346,54 @@ asymmetrically.
 
 ---
 
+### 2b.11 Audit — does the SDPA-only convention break anything else? (dense Phase 2a: yes, real; moe-routing-notes.md: different, milder gap)
+
+**Triggered by §2b.8's own scope inconsistency** (MLA "attention" there included all
+projection matrices, breaking from dense's SDPA-only convention) — asked to
+check whether the underlying assumption caused other real problems across
+`prefill_notes.md`, `decode_notes.md`, `moe-routing-notes.md` before
+proceeding further.
+
+**Confirmed, real, and specifically bounded**: `decode_notes.md` §0 and
+`prefill_notes.md` state directly and deliberately: attention analysis
+there is *"SDPA only (QK^T → softmax → ·V), not the surrounding QKVO/FFN
+projection weights."* Correct scope for that project's own purpose
+(studying attention's distinctive hardware behavior — QKVO are plain dense
+matmuls with nothing attention-specific about them). This project reused
+those SDPA-only numbers directly for **throughput/service-time/chip-ratio**
+purposes — a different use case that never re-examined whether the narrow
+scope still fit. §2.4 caught and fixed the FFN half of the resulting gap.
+**QKVO projections were never added anywhere, for either prefill or
+decode, in dense's entire Phase 2a.**
+
+**Quantified**: QKVO FLOPs/token/layer = `2×d_model×(n_heads·d_head) ×2
+[Q,O] + 2×d_model×(n_kv_heads·d_head) ×2 [K,V] = 301,989,888` — **exactly
+21.4% of FFN's 1,409,286,144 FLOPs/token/layer**, and identically 21.4% on
+the weight-bytes side too (75.5MB vs. FFN's 352.3MB) — same ratio in both
+FLOPs and bytes since it's the same precision and a proportional
+params↔FLOPs relationship. Not a rounding error, not order-of-magnitude —
+a real, consistent ~1/5 addition to the dominant term, in both phases, in
+both regimes (adds compute time to prefill's compute-bound service, adds
+memory time to decode's memory-bound service).
+
+**Implication, not yet resolved**: dense's Phase 2a service times,
+throughput/chip numbers, and the ~5.5:1 ratio itself are all built on
+numbers missing this ~21% addition. Whether the final ratio shifts a
+little or a lot depends on whether it hits prefill and decode
+symmetrically — not obvious without actually recomputing. **Open decision**:
+fix this before finalizing the 2a-vs-2b chip-ratio comparison (more
+correct, but touches "done" numbers again) vs. proceed with MoE prefill
+first and circle back (keeps momentum, but risks comparing 2b's complete
+numbers against 2a's still-incomplete ones for longer than necessary).
+
+**`moe-routing-notes.md` does not have this same bug** — it never used
+SDPA-only attention FLOPs at all, because it never derived attention FLOPs
+at all (§6's own gap list: attention there was scoped to weight/KV-cache
+*footprint* and comms-irrelevance only). A different, milder category of
+gap — total absence rather than a narrow-but-inconsistent scope — and not
+something this project's own Phase 2b work inherited, since §2b.8 derived
+MLA attention FLOPs fresh rather than reusing anything from
+`moe-routing-notes.md`.
+
+---
+
