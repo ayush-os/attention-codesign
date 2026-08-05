@@ -1306,3 +1306,43 @@ number already was. Todo item 3 resolved as a byproduct, not deferred.
 ~63% of dense's per-chip request throughput. Feeds directly into the
 chip-ratio comparison once prefill is derived (§2b's remaining item).
 
+### 2b.10 Why FFN's crossover sits so much higher than dense's — the mechanism, not just the number
+
+**Question raised**: §2b.9 asserted FFN is memory-bound at N=640 without
+explaining *why* mechanically (attention's compute-bound result was
+intuitive — MLA trades bytes for FLOPs — but FFN's memory-bound result
+wasn't, on its own).
+
+**The mechanism**: two facts combine, not one.
+1. **Bytes hit a hard ceiling once the batch saturates** (§2b.2/2b.7): past
+   N≈232, virtually every one of a device's 22 local experts gets touched by
+   *someone* in the batch, so bytes moved stops growing with N — capped at
+   loading the whole local table once (≈259.5MB). This is now mechanically
+   **identical to dense's own flat, batch-invariant FFN bytes** (§2.4/2.5) —
+   arrived at by saturation instead of dense's "always touches everything,"
+   but the same shape once you're past the saturation point.
+2. **Compute has no ceiling** — FLOPs grow linearly with N forever, no
+   saturation on the compute side.
+
+Past saturation, MoE's FFN behaves exactly like dense's FFN mechanically:
+fixed bytes vs. ever-growing compute, regime purely a function of whether N
+is large enough for compute to catch up. N=640 is well past the bytes
+saturation point (N≈232) but far short of the compute crossover
+(N≈6,459/807 per device) — that gap is why it's memory-bound.
+
+**Why MoE's crossover (807/device) sits so much higher than dense's (296)
+— checked mechanically, not assumed**: MoE's fixed bytes are *smaller* than
+dense's (259.5MB vs. 352.3MB, 0.74×) — naively you'd expect a *lower*
+crossover. But MoE's compute/token is *much* smaller too (8-of-162 experts
+computed/token vs. dense's full FFN every token: `8×47,185,920 =
+377,487,360` vs. `1,409,286,144`, 0.27×) — and that effect dominates.
+Predicted crossover ratio = `bytes_ratio/flops_ratio = 0.74/0.27 ≈ 2.75×`;
+observed = `807/296 ≈ 2.73×` — matches. **MoE needs proportionally more
+tokens per chip to generate enough FLOPs to catch its own fixed memory
+cost, precisely because sparsity cuts compute harder than it cuts the
+weight footprint.** Not a fluke of the specific numbers — a direct,
+generalizable consequence of sparsity hitting compute and memory
+asymmetrically.
+
+---
+
