@@ -1397,3 +1397,30 @@ MLA attention FLOPs fresh rather than reusing anything from
 
 ---
 
+## Phase 2b continued — Prefill and the final MoE chip-ratio hypothesis
+
+### 2b.12 Naive vs. absorbed for prefill — a real fork, resolved by mechanism not habit
+
+**Question raised**: does §2b.8's decode formula (absorbed) carry over to
+prefill, just scaled by more tokens?
+
+**No — a real, distinct fork.** Absorption exists specifically to avoid
+*repeatedly* re-materializing cached K/V from prior steps, every single
+decode step. Prefill has no such repetition — K/V is computed **once**,
+for the whole prompt, in one pass. So the tradeoff that motivates
+absorption in decode doesn't exist in prefill: **naive (explicit K/V
+up-projection) is the right choice for prefill**, absorbed for decode.
+Matches real MLA serving implementations, which use exactly this
+naive-prefill/absorbed-decode split for the same reason.
+
+**Causal-masking convention**: checked against precedent rather than
+introducing a new treatment — `prefill_notes.md`'s own dense prefill FLOPs
+(`2×32×64×8192²×128`) uses the **full `seq_len²`, no causal discount**, and
+this project's own §2.3 seq_len=512 recompute preserved that convention
+exactly. Quantified whether a causal discount would matter before deciding:
+even a full 50% cut to dense's attention-core term would move dense's total
+prefill service time by **<0.5%** (attention is <1% of the total, §2.9) —
+decision-irrelevant. Kept the same full-`seq_len²` convention for MLA, for
+consistency with dense rather than introducing a new asymmetry in the
+opposite direction from the QKVO fix.
+
