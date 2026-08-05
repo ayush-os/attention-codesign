@@ -938,3 +938,60 @@ simplification chosen in §2b.2b (kept for simulator-abstraction reasons),
 not a property of MoE sparsity itself. State both halves together in Phase
 4/5, not just the bytes-moved number in isolation.
 
+### 2b.4 Reversing §2b.2b — sharding (Option B) after all
+
+**Reconsidered after seeing §2b.3's actual numbers, not before.** Two things
+changed the picture that weren't visible when §2b.2b was first decided:
+
+1. **§2b.3's 5.42× finding proves this phase's headline number (decode
+   throughput/chip, feeding the chip ratio) is materially sensitive to
+   replication vs. sharding, not just cosmetically different.** Under full
+   replication, a chip loads from the *global* 162-expert population,
+   saturating almost immediately. Under sharding, a device only ever loads
+   from its own bounded local 20-expert shard — a structurally smaller,
+   slower-saturating curve. This can plausibly change whether/where a
+   compute-bound crossover exists at all (spec_v2 item 3), which would
+   undermine the 2a-vs-2b comparison item 6 explicitly wants, if built on a
+   deployment model real systems don't use.
+2. **Full replication structurally eliminates Phase 3's hot-expert-residency
+   question.** If every chip already holds every expert, there's no
+   placement decision left — residency is already total. Same failure mode
+   already caught once in this project for a different reason: an unbounded
+   intermediate KV pool was rejected in Phase 0 specifically because it
+   "would eliminate the memory-pressure question this whole project exists
+   to study." Full weight replication does the identical thing to Phase 3's
+   residency question — missed when §2b.2b was first decided; this is the
+   more decisive reason of the two.
+
+**The "scope creep" argument that killed Groq doesn't actually transfer
+here.** Groq's rejected sharding meant inventing an unfamiliar ~140-chip
+pipeline topology from nothing, with zero prior characterization anywhere in
+this repo — genuinely a new project's worth of work. MoE's 8-device EP group
+is the opposite: topology (hierarchical mesh), per-device decomposition,
+comms-cost, and the token-arrival model (T/8 home tokens/device +
+E[remote devices/token]=2.625 dispatched-in, `moe-routing-notes.md` §2.1)
+are already fully derived by project #3. Reusing them is the same
+cross-project-reuse discipline already applied throughout Phase 2, not new
+scope. §2b.2b overweighted the Groq analogy.
+
+**Decided: reverse to Option B, expert-parallel sharding, 8-device EP
+group.** §2b.2b's Option A reasoning stays on record above (kept, not
+scrubbed, per this project's own convention) — reasonable given what was
+visible at the time; §2b.3's numbers are what changed it.
+
+**Consequences, stated up front rather than discovered mid-derivation:**
+- **"One decode machine" is redefined as one 8-chip EP group**, not a single
+  atomic chip, for the MoE leg specifically — dense (Phase 1/2a) is
+  unaffected, stays single-chip.
+- §2b.2/§2b.3 need reworking at the **per-device level (n=20 local routed
+  experts, not the global 160/162)**, using project #3's own token-arrival
+  model rather than inventing a new one.
+- **Attention is data-parallel** across the 8 devices per
+  `moe-routing-notes.md` (each device serves its own batch slice, not a
+  shared pool) — Phase-1-style KV-cache capacity per device may need its own
+  look once we get there; flagged, not yet resolved.
+- Dispatch/combine comms cost itself doesn't need re-deriving — project #3
+  already showed it's decisively compute-bound and imbalance-proof. Only the
+  *weight-loading* bytes (this phase's own new contribution) needs fresh
+  per-device treatment.
+
