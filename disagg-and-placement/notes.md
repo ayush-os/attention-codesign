@@ -1523,3 +1523,42 @@ disaggregation story is fundamentally about decode's batching windfall;
 MoE's is about sparsity cutting prefill's cost while decode's own windfall
 stays structurally out of reach at real capacity.
 
+### 2b.17 Two flagged items closed out before wrapping Phase 2b
+
+**Per-device KV-cache capacity under data-parallel attention (§2b.4's
+flag) — already resolved, not actually open.** Checked directly: §2b.7's
+capacity derivation used `weights_per_device = 20.05GB`, which already
+matches `moe-routing-notes.md`'s own stated breakdown — the *full,
+replicated* attention weight stack (8 MLA matrices, data-parallel, no
+sharding) **plus** the *local, sharded* FFN shard (22 experts). The
+per-device HBM budget behind N=640 already correctly reflects data-parallel
+attention. Nothing further to derive — closing the loop explicitly rather
+than leaving it flagged indefinitely.
+
+**Phase 2c's KV-handoff mechanism — real MoE-specific considerations
+found, not a clean "no change needed."** Spec_v2 guessed this "shouldn't"
+need MoE-specific changes since KV cache is an attention-layer artifact;
+checked rather than assumed, and found two real things:
+
+1. **Bytes/token differs a lot, not a rounding difference**: dense =
+   81,920 bytes/token (GQA, Phase 1 §1.2) vs. MoE = 17,280 bytes/token
+   (MLA, `moe-routing-notes.md`) — **dense is 4.74× larger per token**.
+   Whenever Phase 2c actually computes real transfer-cost numbers, MoE
+   needs its own figure, not a reused dense one — flagged in spec_v2 as a
+   "needs its own number" case, now quantified.
+2. **A new decision surface exists, even though the answer is unsurprising**:
+   under dense, "decode machine" is one chip — a handoff has exactly one
+   destination, no decision to make. Under MoE, "decode machine" is an
+   8-chip EP group (§2b.4), and attention is **data-parallel, not
+   replicated** — each device holds only its own batch slice's KV cache,
+   not a shared/mirrored copy. So a prefill→decode handoff for MoE needs to
+   pick **one specific device within the EP group** to permanently own that
+   request's attention. The mechanism itself is classic, sticky-session
+   load balancing (shared queue, each device pulls a new request whenever
+   it has an open slot among its ~80 concurrent-request capacity, §2b.7) —
+   not a hard problem, and not worth over-stating. The actual finding is
+   narrower: dense's single-chip handoff never had a destination to choose
+   in the first place, so this question is new to MoE even though its
+   answer is standard. Worth a one-line note for Phase 2c, not a design
+   question to solve there.
+
