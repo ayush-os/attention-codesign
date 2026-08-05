@@ -902,3 +902,39 @@ N≈296. Next: convert this bytes curve into memory time, alongside MoE
 decode's own FLOPs (attention + FFN, following the 2.1–2.5 chain), to check
 whether a crossover exists at all.
 
+### 2b.3b Reading the 5.42× finding correctly — compute win intact, bandwidth win is deployment-dependent
+
+**Question raised**: does §2b.3's finding (MoE moves *more* bytes/layer than
+dense at every realistic N) mean MoE fails at its own stated purpose?
+
+**No — the compute win and the memory-bandwidth win are separate claims, and
+only one of them depends on the §2b.2b deployment choice.**
+
+**Compute win, checked directly against Llama-3-70B, still fully intact**:
+dense FFN FLOPs/token/layer = `3×2×8,192×28,672 = 1,409,286,144`; MoE FFN
+FLOPs/token/layer (8 active experts) = `8×3×2×5,120×1,536 = 377,487,360` —
+**MoE does ~3.73× fewer FLOPs/token/layer than dense**, despite DeepSeek-V2
+having ~3.4× more total parameters (236B vs. 70B). FLOPs cost is
+`N×8×FLOPs/expert` regardless of deployment model — this holds whether
+weights are replicated or sharded, so nothing in §2b.3 threatens it.
+
+**Memory-bandwidth win is real only under sharding, and full replication
+(§2b.2b's choice) specifically forfeits it.** Sparsity only saves
+weight-loading bytes if "the whole table" is something a device would
+otherwise have to fetch. Under full replication every chip already holds
+all 162 experts permanently — the only thing left to save is how much of
+that already-resident table gets pulled off HBM per step, and §2b.3 showed
+that saturates almost immediately (past dense's flat number by N≈9, past
+90% of the table by N≈232). Under **sharding** (the deployment
+`moe-routing-notes.md` actually uses, Option B from §2b.2b), a device only
+ever loads from its own bounded local 20-expert shard — genuinely sparse,
+never racing toward the global 162-expert ceiling. Sharding is the
+mechanism that keeps MoE's bandwidth savings real at scale; full replication
+trades that benefit away.
+
+**Framing for the write-up**: §2b.3's 5.42× number is not evidence MoE
+underperforms dense — it's a quantified cost of the Option A deployment
+simplification chosen in §2b.2b (kept for simulator-abstraction reasons),
+not a property of MoE sparsity itself. State both halves together in Phase
+4/5, not just the bytes-moved number in isolation.
+
