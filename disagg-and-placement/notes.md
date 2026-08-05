@@ -1232,3 +1232,77 @@ per-position slope, vs. vanilla's no-fixed-term, steeper-slope shape.
 per the consistency call in §2b.7) to get full per-device decode service
 time and run the regime-crossover check.
 
+### 2b.9 MoE decode regime crossover and throughput — spec_v2 item 3 answered
+
+**Correction caught before combining**: the seq_len_k used in §2b.8's headline
+number was wrong — N=640 (batch/concurrency) had been used in place of
+`seq_len_k` (context length). These are different parameters. Reused
+`seq_len_k=544` instead (dense's own DistServe-anchored average context,
+§2.3 — same workload-agnostic request-shape model spec_v2 says the
+simulator reuses). Corrected attention FLOPs/token/layer = **584.19M**, not
+611.0M.
+
+**FFN FLOPs/device/layer at T=640 (N/device=80)**: total (token,expert)
+compute pairs, all 8 experts/token regardless of distinctness (FLOPs, unlike
+bytes, doesn't care which experts overlap) = `80×8×47,185,920 =
+30,198,988,800`. Split: `F_shared,device=7.55B`, `F_routed,device=22.65B`
+(same formula shape as `moe-routing-notes.md` §2.2, recomputed at the
+correct T).
+
+**Per-device regime, both sublayers, TPU 8i FP4 (peak=10.1×10¹⁵ FLOPs/s,
+BW=8.6×10¹² B/s)**:
+
+| | Attention | FFN |
+|---|---|---|
+| FLOPs/device/layer | 46.74B | 30.20B |
+| Bytes/device/layer | 12.53 MB (KV-cache reads, 576 elem/position × 0.5B FP4) | 258.05 MB (§2b.7) |
+| Compute time | 4.627 µs | 2.990 µs |
+| Memory time | 1.457 µs | 30.006 µs |
+| **Regime** | **Compute-bound, 3.17×** | **Memory-bound, 10.04×** |
+| Service (max) | 4.627 µs | 30.006 µs |
+
+**Combined/layer = 34.633 µs; ×60 layers = 2.078 ms/decode step.**
+
+**A genuinely new finding vs. dense**: attention is *compute*-bound here,
+not a rounding error the way it was for dense (<1–5% of service time,
+§2.5) — it's ~13% of combined service time (4.627 of 34.633 µs). Root
+cause: MLA's absorbed-inference FLOPs (§2b.8) carry a large fixed
+per-token overhead (432.67M FLOPs, dominated by the absorbed-query and
+output-projection terms) that vanilla GQA never had — dense's attention was
+negligible specifically because GQA has no comparable fixed cost. MLA
+being compute-efficient in its *bytes* (compressed KV cache, only 12.53MB
+vs. FFN's 258MB) doesn't mean it's compute-*cheap* — the absorption trick
+that shrinks the bytes side adds real FLOPs on the compute side as the
+price of avoiding cache re-expansion.
+
+**spec_v2 item 3 (does a crossover exist) — answered, third outcome
+of the three flagged as possible**: FFN's bytes are already saturated
+(≈259.5MB ceiling, N-independent past §2b.2's N≈232) while its FLOPs scale
+linearly with N — so a compute-bound crossover exists *mathematically* at
+**system-wide N≈6,459**. But DeepSeek-V2's own real HBM-capacity ceiling
+(§2b.7) is N≈640–680 — **an order of magnitude below the crossover**. So
+**FFN never reaches compute-bound at any batch size this model could
+actually run at its real memory capacity** — memory-bound *in practice*,
+blocked by a capacity ceiling, not memory-bound *by structural proof* the
+way dense's imbalance floor was immune to any input (`moe-routing-notes.md`
+§2.2's ≈21,065 FLOPs/byte floor). A meaningfully different flavor of
+"memory-bound" than dense's, worth stating as such rather than collapsing
+both into the same label.
+
+**Throughput**: token throughput/device = `80/(34.633µs×60) ≈ 38,499
+tok/s`; request throughput (÷64, DistServe-anchored avg output length) ≈
+**601.55 req/s/chip**.
+
+**Chip-counting convention resolved, not just assumed**: this figure is
+naturally comparable to dense's own per-chip number (951.6 req/s/chip,
+§2.5) without needing a separate EP-group-vs-chip conversion — each of the
+8 EP-group devices already carries its own full compute obligation per step
+(home tokens' attention/shared-FFN + its share of inbound-dispatched routed
+FFN, via the uniform-baseline `(T/8)×...` accounting already used
+throughout), so "per device" here *is* "per chip" in the same sense dense's
+number already was. Todo item 3 resolved as a byproduct, not deferred.
+
+**MoE/dense throughput ratio: 601.55/951.6 ≈ 0.632** — MoE decode delivers
+~63% of dense's per-chip request throughput. Feeds directly into the
+chip-ratio comparison once prefill is derived (§2b's remaining item).
+
