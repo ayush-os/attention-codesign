@@ -294,3 +294,141 @@ homogeneous TPU 8i.
   deliberately deferred rather than chased (first in `decode_notes.md`).
 
 ---
+
+## Phase 1 — Characterize the memory hierarchy problem
+
+### 1.1 Weight footprint and remaining HBM
+
+Llama-3-70B, FP4 (0.5 bytes/param): weights = `70×10⁹ × 0.5 = 35×10⁹ bytes`
+= **35 GB**. TPU 8i HBM/chip = 288 GB (reused directly from the MoE
+project). Remaining after weights = `288 − 35` = **253 GB**.
+
+No sharding needed — unlike the rejected Groq design, weights comfortably
+fit on a single chip, confirming the homogeneous-TPU-8i call was the right
+practical tradeoff (see Chip choice, above).
+
+### 1.2 KV cache bytes/token — the growth curve
+
+Formula (GQA, summed across all layers):
+`bytes/token = 2 (K+V) × precision_bytes × d_head × n_kv_heads × n_layers`.
+
+At FP4 (0.5 B), `d_head=128`, `n_kv_heads=8`, `n_layers=80` (verified via
+[HF config](https://huggingface.co/unsloth/Llama-3.3-70B-Instruct/blob/main/config.json)
+— a genuinely new number for this project; the attention project only ever
+analyzed one layer in isolation and never needed a total layer count):
+
+`2 × 0.5 × 128 × 8 × 80 = 81,920 bytes/token (80 KiB/token)`.
+
+This *is* spec Phase 1's requested growth curve: `KV(context_len) =
+context_len × 81,920 bytes`, linear, GQA already folded in via
+`n_kv_heads=8` (MHA would give 8× this, `n_heads=64`).
+
+### 1.3 Activation/overhead reservation — mostly ruled out, narrowed to one real term
+
+Worked through and **rejected** as material to the HBM reservation:
+transient S/P/softmax-state activations, under the fused execution model
+this project's own attention work already established (`prefill_notes.md`
+§1.2/§2.3), live in TPU 8i's on-chip SRAM (384MB) during compute, not HBM —
+a separate physical budget, following directly from "stationary is scoped to
+a specific memory boundary" (`prefill_notes.md` §2.6, Key Takeaways #4/#8).
+Q/O — the terms that genuinely do touch HBM — are real but negligible at
+this scale (prefill's fused MHA Q+O ≈ 4 GiB at int8 per `decode_notes.md`
+§1.4; decode's ≈ negligible; both dwarfed by KV cache's hundred-GB scale).
+
+What's left, and real: **block-allocation fragmentation**, sourced directly
+from this project's own Phase 0 reading rather than invented — PagedAttention's
+reported 10–15% fragmentation under 16-token block allocation (vs. 60–80%
+naive contiguous allocation). **Decided: reserve 10–15%** of the post-weights
+HBM budget for this — not the MoE project's 46% margin, since that covered a
+different mechanism (activation/router memory on a different chip) no
+longer analogous once activations were ruled out here.
+
+### 1.4 Aggregate KV-cache token capacity
+
+`usable KV budget = 253 GB × (1 − reserve)`
+
+| Reserve | Usable KV budget | Aggregate tokens |
+|---|---|---|
+| 10% | 227.7 GB | 227.7×10⁹ / 81,920 ≈ **2,779,541** |
+| 15% | 215.05 GB | 215.05×10⁹ / 81,920 ≈ **2,625,122** |
+
+**Range: ≈2.63M–2.78M aggregate tokens** of KV-cache capacity per TPU 8i
+chip, at FP4, after weights and fragmentation overhead. This is an
+*aggregate* figure — capacity shared across however many requests are
+concurrently resident on one decode machine at once (Phase 0's "N
+concurrently active requests bounded by memory" design), not a
+single-request maximum.
+
+### 1.5 Aggregate tokens → N concurrent requests (resolved)
+
+Chose (a) from the fork below: a **hard per-request context-length cap of
+8,192 tokens** — not arbitrary, it's Llama 3's own native context length,
+and the exact `seq_len` already reused across every document in this repo
+("for cross-project comparability," per the MoE project's own stated
+reasoning for the same number) — reused a third time rather than
+introducing a new ungrounded figure.
+
+`N = budget / cap`:
+
+| Reserve | Aggregate tokens | N (max-length requests) |
+|---|---|---|
+| 10% | 2,779,541 | `2,779,541 / 8,192` = **339** (339×8,192=2,777,088 fits; 340 wouldn't) |
+| 15% | 2,625,122 | `2,625,122 / 8,192` = **320** (320×8,192=2,621,440 fits; 321 wouldn't) |
+
+**N = 320–339 concurrent max-length requests per decode chip**, safe by
+construction — the literal worst case (every slot simultaneously at the
+8,192-token cap) still fits exactly.
+
+**Follow-on, quantifying the cost of that conservatism**: N above assumes
+every concurrent request is maxed out. Phase 0's own request-length model
+(lognormal, ~576 tokens average — 512 in + 64 out, DistServe-anchored) says
+most won't be. At the *average* length instead of the cap, the same budget
+supports `2,779,541 / 576 ≈ 4,827` (10%) to `2,625,122 / 576 ≈ 4,558` (15%)
+concurrent requests — **~14× more** than the worst-case-safe static number.
+Doesn't resolve the hard-cap-vs-dynamic-admission fork below, but quantifies
+how much throughput is actually at stake in that choice.
+
+**Still open, still explicitly Phase 3's job**: (a) vs. (b) below wasn't
+chosen for *production* semantics, just to get a concrete N for this
+project's own sizing — either a hard per-request cap (chosen above, simple,
+safe, ~14× conservative) or usage-tracked dynamic admission (mirrors the
+intermediate pool's own "block until space frees" placeholder, recurring one
+level down inside a single decode machine, real throughput but real
+complexity). **What happens at the cap itself** (hard stop, matching real
+chatbot behavior, vs. compaction/sliding-window, matching coding-agent-style
+context management) is explicitly Phase 3 territory (spec's own pointer to
+"attention sink / sliding window approaches"), not resolved here.
+
+### 1.6 Core tension — static/fixed weights vs. dynamic/open-ended KV cache
+
+Spec Phase 1's third ask, stated explicitly rather than left implicit.
+
+**Real-world grounding first**: no real deployment replicates weights
+anymore, especially at multi-trillion-parameter scale — sharding
+(tensor/pipeline parallelism) amortizes the weight cost across a pool
+instead of paying it again on every chip, a strictly better use of space
+once a model is large enough. This project's homogeneous TPU 8i design
+*does* replicate (every chip holds a full 35GB copy) — a deliberate
+simplification (see Chip choice, above), specifically defensible **only
+because of Llama-3-70B's scale relative to TPU 8i's HBM**: `35GB/288GB ≈
+12%` wasted per chip is cheap enough to not matter. This would not hold at
+trillion-parameter scale, where the model could exceed a single chip's
+*entire* HBM, not just its SRAM — at that point sharding stops being merely
+better and becomes mandatory, independent of memory type. Stated as an
+explicit boundary condition on this project's simplification, not left
+implicit.
+
+**The durable tension, independent of replication vs. sharding**: weights
+are a fixed-size cost, known the instant a model is chosen, paid once and
+never revisited regardless of serving load. KV cache is open-ended — it
+grows with every token generated for every live conversation, with no
+natural ceiling except whatever hardware capacity or an explicit policy
+imposes (§1.5's cap question).
+
+**Implication for placement (Phase 3)**: weights are never a lever in the
+placement story — they can't shrink, can't be evicted, can't be delayed.
+**KV cache is the only elastic resource in the entire system** — every real
+placement/eviction question this project asks from here on is about KV
+cache, never about weights.
+
+---
