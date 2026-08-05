@@ -995,3 +995,55 @@ visible at the time; §2b.3's numbers are what changed it.
   *weight-loading* bytes (this phase's own new contribution) needs fresh
   per-device treatment.
 
+### 2b.5 Per-device distinct experts touched and bytes moved — the reworked §2b.2/2b.3
+
+**Key simplification, not obvious up front**: under uniform random
+device-to-expert assignment (`moe-routing-notes.md`'s own sourced deployment
+fact: "routed experts uniformly deployed on 8 devices" — reused, not
+assumed), linearity of expectation gives an exact result without needing a
+fresh per-device population/N model or Monte Carlo:
+
+`E[local routed experts touched] = E[global routed experts touched] / 8`
+
+Both the touched-count *and* the local population (160/8=20) scale down by
+the same factor of 8, so **the local fraction touched equals the global
+fraction touched exactly** — no separate "local N" concept needed. N=320
+carries over directly as the whole 8-device EP group's total token count
+(consistent with §2b.4's redefinition of "one decode machine" = one EP
+group, matching how N=320 was already defined in Phase 1).
+
+**Computed at N=320** (reusing §2b.2's calibrated Zipf, `s=1.076`):
+- Global routed touched = 151.488/160 (94.68%) — global total (+2 shared)
+  = 153.488/162 (94.75%), matching §2b.2/2b.3 exactly.
+- **Per-device routed touched = 151.488/8 = 18.936/20 (94.68%,
+  same fraction)**; 2 shared experts always locally resident and always
+  touched (100%, deterministic, replicated per device).
+- **Per-device total touched = 2 + 18.936 = 20.936/22 (95.16%)**.
+
+**Per-device bytes moved/layer** = `20.936 × 11,796,480 B ≈ 247.0 MB` — using
+the correct shared(100%)+routed(94.68%) split rather than blending both at
+the same global percentage (which would give ≈245.9 MB, a ~1MB/0.4%
+difference — negligible, but the split is free once the reason for it is
+clear, so kept exact rather than approximated).
+
+**The headline reversal from §2b.3**: per-device, MoE now moves **fewer**
+bytes/layer than dense's flat 352.3 MB (247.0 MB, **0.70× dense**, not
+5.14×) — the opposite conclusion from the full-replication case, and the
+direction §2b.3b predicted sharding should restore. Sparsity's
+bandwidth benefit is real again once the population it saturates against is
+the bounded local shard (20-22), not the global table (162).
+
+**Caveat carried forward**: this result depends on device assignment being
+uncorrelated with popularity. If a real system deliberately load-balances by
+placing popular experts across devices (a real technique in some production
+MoE serving stacks), this exact symmetry breaks and per-device variance
+would matter more than the expected value alone. No evidence of that here —
+`moe-routing-notes.md`'s own source states uniform deployment — so treated as
+a reasonable default, flagged rather than fully ruled out.
+
+**Sets up spec_v2 item 3 (regime crossover) properly this time**: next step
+is comparing this 247.0 MB/layer memory-time figure against per-device MoE
+decode FLOPs (attention + FFN) to check for a compute-bound crossover —
+same chain as §2.5's dense derivation, now on the corrected per-device
+numbers instead of the superseded global ones.
+
