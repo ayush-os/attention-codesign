@@ -1047,3 +1047,63 @@ decode FLOPs (attention + FFN) to check for a compute-bound crossover —
 same chain as §2.5's dense derivation, now on the corrected per-device
 numbers instead of the superseded global ones.
 
+### 2b.6 Batching helps throughput and hurts bandwidth-sparsity simultaneously — a tension dense never had
+
+**247MB/layer (0.70× dense) looked too high on first read** — worth
+resolving mechanistically rather than accepted or shrugged off, per this
+project's own practice. Checked by computing the per-device bytes curve
+across N instead of only at N=320:
+
+| N (whole EP group) | local touched (/22) | bytes/layer | vs. dense |
+|---|---|---|---|
+| 1 | 2.65 (12.0%) | 31.2 MB | 0.09× |
+| 8 | 5.28 (24.0%) | 62.3 MB | 0.18× |
+| 32 | 10.05 (45.7%) | 118.5 MB | 0.34× |
+| 100 | 16.03 (72.9%) | 189.1 MB | 0.54× |
+| 232 | 19.97 (90.8%) | 235.6 MB | 0.67× |
+| **320 (this project's decode-N)** | **20.94 (95.2%)** | **247.0 MB** | **0.70×** |
+| →∞ (saturation floor) | 22.00 (100%) | 259.5 MB | **0.74× — sharding's best possible case at this N-scale** |
+
+**Root cause**: per-token sparsity (8-of-162 experts) and per-device-per-step
+sparsity (aggregated over a whole concurrent batch) are different
+quantities. At N=320, total system-wide (token, routed-expert) dispatch
+events = `320×6=1,920`, ≈240/device on average — 240 hits landing in a
+20-slot local pool is a coupon-collector saturation regime, not a sparse
+one. The local shard is simply too small relative to this project's own
+batch size to stay sparse; **the real savings window is at small N (0.09×
+at N=1, 0.34× at N=32), and it's mostly spent by N=320** — a batch size
+chosen in Phase 1 for HBM-capacity reasons, entirely unrelated to MoE.
+
+**A genuinely new tension MoE introduces that dense never had**: for dense,
+larger N was purely good — pure amortization upside, no downside (§2.5:
+N=320 turned FFN compute-bound with zero tradeoff). For MoE under sharding,
+**the same N that helps throughput amortization actively erodes
+bandwidth-sparsity** — batching is a two-sided lever here, not a one-sided
+one. Bears directly on spec_v2 item 6 ("does disaggregation work the same
+way once you're serving MoE") — the batching/N story is structurally
+different for MoE, not just a different number.
+
+**Correction, caught by asking "shouldn't 22 experts obviously move less
+than dense's one big block" rather than accepting 0.70× at face value**:
+decomposing 247.0MB into its two separate causes shows routing sparsity is
+doing almost none of the work at N=320:
+
+| Component | Bytes/layer | vs. dense |
+|---|---|---|
+| Dense (baseline) | 352.3 MB | — |
+| **Sharding-topology floor** (all 22 local experts loaded every step, *zero* credit for routing selectivity) | 259.5 MB | 73.7% (26.3% reduction) |
+| **Actual, with N=320 routing sparsity on top** | 247.0 MB | 70.1% (further 4.8% reduction, 12.5 MB) |
+
+**26.3 percentage points of the "smaller than dense" result is just the
+sharding split** (20 narrow DeepSeek-V2 experts/device, `d_ff=1,536`,
+happening to sum to a bit less than dense's one wide FFN block,
+`d_ff=28,672` — a fact about relative dimensions, unrelated to sparsity).
+**Only 4.8 points come from routing sparsity actually doing work** — and
+that's because §2b.6's saturation argument already applies: at N=320 the
+local shard is 95.2% touched, so there's almost nothing left for
+selectivity to save. The genuinely sparsity-driven regime is the small-N
+end of the table above (0.09×/0.34× at N=1/32), not N=320. State both
+numbers in the write-up — "MoE moves fewer bytes than dense at this batch
+size" is true but for a much less interesting reason than "sparse routing
+saves bandwidth."
+
