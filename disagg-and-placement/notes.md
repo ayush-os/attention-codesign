@@ -1424,3 +1424,21 @@ decision-irrelevant. Kept the same full-`seq_len²` convention for MLA, for
 consistency with dense rather than introducing a new asymmetry in the
 opposite direction from the QKVO fix.
 
+### 2b.13 Naive prefill attention FLOPs — derived, cross-validated
+
+**Per-token fixed cost** (down-proj + **explicit** up-proj + RoPE +
+output-proj, all naive): **149,225,472 MACs** — validated independently:
+this exactly matches `moe-routing-notes.md`'s own stated *"Attention (8 MLA
+matrices, unsharded): 149,225,472 params/layer"* (mechanically expected —
+MACs for one token through a linear layer equal that layer's param count —
+but a clean, independent cross-check nonetheless).
+
+**Per-(query,key)-pair core cost** (naive per-head dims: `d_h+d_h^R=192`
+for score, `d_h=128` for weighted-sum): 40,960 MACs = 81,920 FLOPs/pair.
+
+**Total, batch=32, seq_len=512, full (no causal discount)**: tokens=16,384,
+pairs=8,388,608 → **5,577,015,033,856 FLOPs** (projections 87.68%, core
+12.32% — projections dominate even prefill's own attention total,
+reinforcing that the causal-discount question was never going to matter
+much).
+
