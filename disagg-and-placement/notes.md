@@ -634,6 +634,23 @@ FFN correction — not a forced match, a mechanistically-explained convergence.
    ~5.5:1 ratio wasn't tuned to match DistServe; it fell out of fixing a
    genuine mechanistic gap (FFN batch-amortization), and happened to land in
    the expected direction.
+6. **"Decode is hard" and "prefill needs more chips" are not in tension —
+   they're the same fact from two different angles.** "Decode is hard" is a
+   per-request compute-*utilization* statement (memory-bound → the compute
+   engine sits mostly idle). The chip-ratio question is about aggregate
+   *throughput per chip*, and those pull in opposite directions precisely
+   because of *why* decode is memory-bound: at batch=32, decode's FFN margin
+   was 9.2× memory-bound — meaning ~9× idle compute headroom, directly
+   exploitable by batching since FFN's weight bytes are batch-invariant while
+   FLOPs aren't (§2.4/§2.5). That idle headroom is exactly what N=320
+   converted into the 6.6× throughput jump. Prefill's FFN margin at batch=32
+   was already 40.4× *compute*-bound (memory time ~2.5% of total) — there's
+   no comparable idle capacity left to exploit via batching, so its
+   throughput per chip is close to fixed and adding capacity means adding
+   chips. **General lesson: the more severely memory-bound a workload is, the
+   more upside batching creates, because there's more idle compute to
+   convert — being "hard" per-request and being "cheap to scale" via batching
+   are the same underlying property, not opposing ones.**
 
 ### 2.8 Open threads carried forward
 
