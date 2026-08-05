@@ -679,4 +679,72 @@ FFN correction — not a forced match, a mechanistically-explained convergence.
   length (544)** — flagged, not resolved via full distributional integration
   (§2.3).
 
+### 2.9 QKVO correction — the SDPA-only gap fixed (supersedes §2.5/§2.6's ratio)
+
+**Root cause** (full audit in §2b.11, done during the MoE leg but the fix
+belongs here): `prefill_notes.md`/`decode_notes.md`'s attention numbers are
+explicitly SDPA-only ("not the surrounding QKVO/FFN projection weights") —
+correct for that project's own microarchitecture question, but silently
+incomplete once reused here for throughput/service-time purposes. §2.4
+caught and fixed the FFN half of the gap; QKVO itself was never added,
+for either phase, until now.
+
+**QKVO FLOPs/bytes per token/layer** (`d_model=8,192`, `n_heads=64`,
+`d_head=128`, `n_kv_heads=8`, standard `2×M×N` per projection):
+`Q_proj+O_proj = 2×2×d_model×(n_heads·d_head)`, `K_proj+V_proj =
+2×2×d_model×(n_kv_heads·d_head)` → **301,989,888 FLOPs/token/layer**,
+weight bytes (FP4) = **75,497,472 B** — exactly **21.4% of FFN's magnitude**
+in both FLOPs and bytes (§2b.11). Weight-stationary/batch-invariant, same
+amortization treatment as FFN's own bytes (§2.4).
+
+**Prefill** (batch=32, seq_len=512 → 16,384 tokens/step): QKVO FLOPs =
+16,384×301,989,888 ≈ 4.948×10¹²; compute_t=489.88µs, mem_t=8.78µs →
+**compute-bound** (consistent with prefill's existing regime). QKVO service
+= 489.88µs, added to the existing 2,313.3µs combined/layer →
+**new combined/layer = 2,803.2µs**; ×80 layers = 224.26ms; **throughput =
+142.70 req/s/chip** (down from 172.91, **−17.48%**).
+
+**Decode** (N=320): QKVO FLOPs = 320×301,989,888 ≈ 9.664×10¹⁰;
+compute_t=9.57µs, mem_t=8.78µs → **compute-bound** (a change from the rest
+of decode's memory-bound FFN — QKVO's own regime, evaluated independently,
+same as attention/FFN each get their own). QKVO service = 9.57µs, added to
+the existing 65.68µs combined/layer → **new combined/layer = 75.25µs**;
+×80 layers = 6.020ms; token throughput = 53,157.6 tok/s; **request
+throughput = 830.59 req/s/chip** (down from 951.58, **−12.72%**).
+
+**Corrected ratio**: `830.59/142.70 ≈ 5.82` → **~5.82 prefill chips per
+decode chip** (up from §2.6's ~5.50, a **+5.8% shift** — real but bounded,
+not order-of-magnitude). Mechanism: QKVO hits both phases, but prefill's
+service time is more heavily weighted toward compute (already 40.4×
+compute-bound before this fix) — adding another purely compute-bound term
+lands proportionally harder there (+21.2% combined/layer time) than on
+decode's already-mixed regime (+14.6%), which is why the ratio moves in the
+direction of needing slightly *more* prefill chips per decode chip, not
+fewer.
+
+**This is now the authoritative dense chip-ratio figure (~5.82:1),
+superseding §2.6's ~5.5:1** — kept on record above rather than edited, per
+this project's own convention (Groq reversal, FP4/FP8 precision reversal).
+The mechanistic story from §2.7's Key Findings (FFN batch-invariance
+driving the whole result, the "decode is hard ⇒ cheap to scale" argument)
+is unaffected — QKVO doesn't change *which* term dominates either regime,
+only adds a modest, now-correctly-counted addition on top.
+
+**Why the ratio barely moved despite a real 21.4%-of-FFN correction — an
+Amdahl's Law mechanism, same shape `prefill_notes.md` already named once for
+a different lever.** `impact_on_total = local_magnitude × share_of_total`:
+QKVO's local magnitude is fixed (21.4% of FFN, always), but FFN's own share
+of each phase's total differs (98.8% prefill, 68% decode) — so the same
+local addition produces different total impact per phase (21.15% vs.
+14.55%), not because the two hits were close to equal (they weren't — a
+real ~45% relative difference) but because *neither* hit was large enough
+on its own to swing a ratio (both phases retained >82% of their original
+throughput). `prefill_notes.md`'s own Key Takeaway #3 named this exact
+mechanism for GQA's byte savings (*"the real 8× local win produces ~0%
+total win... purely a function of what fraction of the current bottleneck
+it touches"*) — different lever (an added cost here, vs. a removed one
+there), identical structural shape: a fixed local change, scaled by the
+affected term's variable share of the total.
+
 ---
+
