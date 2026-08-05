@@ -171,3 +171,126 @@ pressure behavior realistic. Flagged explicitly as a low-priority
 approximation — not load-bearing to get exactly right.
 
 ---
+
+### Chip choice — TPU 8i, homogeneous (prefill *and* decode)
+
+**Final: TPU 8i for both pools.** Arrived at after first choosing, then
+deliberately reversing, a heterogeneous TPU 8i (prefill) / Groq (decode)
+split — full reasoning on both sides kept below rather than scrubbed, per
+this project's own house style of keeping rejected paths on record.
+
+**Why heterogeneous Groq-decode was tried first**: on TPU 8i alone, the
+Phase 1 capacity math would just repeat the MoE project's own weights/HBM-
+budget derivation with different totals — no new question. Groq is
+architecturally SRAM-only (no HBM at all), which is the exact "SRAM-only /
+no-HBM architectures (Groq, Cerebras precedent)" thread `decode_notes.md`
+flagged and explicitly deferred ("would need its own ridge-point
+recomputation under SRAM-scale bandwidth") rather than chased. Decode sitting
+~30–240× below the HBM ridge point *is* the argument for going there —
+removing HBM from the roofline entirely, rather than tiling around it the
+way Gemmini had to.
+
+**Why it was reversed**: attempting the actual Phase 1 arithmetic surfaced a
+problem no amount of "just do more math" fixes. Groq's per-chip SRAM (500MB)
+can't hold Llama-3-70B's weights (≈70GB at FP8) at all — a real deployment
+needs the model pipeline-sharded across ~140+ chips. That's not just harder
+arithmetic than TPU 8i's "everything fits on one chip" case — it breaks the
+unit of abstraction Phase 0's simulator design already committed to, where
+"a decode machine" is one atomic unit holding N concurrent requests bounded
+by *its own* memory. On Groq, "one decode machine" is actually a pipeline of
+~140+ chips acting together, which would force reworking what "a machine"
+means in the sim already built, not just adding a harder capacity
+calculation on top. At that point the project stops being about
+disaggregation/placement and starts also being about pipelined
+model-parallelism on a memory-starved chip — precisely the scope-creep
+failure mode `spec.md`'s own "Note on scope" section warns against ("a
+single project trying to simultaneously handle sharding + disaggregation +
+MoE + KV placement would force shallow treatment of each piece"). Decided
+this is a legitimate, real future thread (a focused fourth project could do
+it justice) rather than something to smuggle into this one — same "flagged,
+not chased" move `decode_notes.md` already made with this exact idea once.
+
+Considered and rejected (independent of the Groq reversal): Cerebras (a
+wafer *is* the whole device — breaks the "chip ratio" framing this project
+and the MoE project both depend on); Trainium/AMD/MTIA/Maia (all still
+HBM-based, same regime as TPU, no new architectural axis).
+
+**Groq reference chip specs — kept for a possible future project, sourced
+but never used in any derivation here:**
+
+*Groq "3 LPX" (current generation, chosen as canonical) — confirmed directly
+via [groq.com](https://groq.com/lpu-architecture), stated at rack
+granularity; per-chip figures below are exact division (256 chips/rack), not
+estimates, cross-checked against secondary per-chip reporting (~500MB /
+~150TB/s) for consistency:*
+
+| Spec | Value |
+|---|---|
+| Rack | 256 LPUs, 128 GB aggregate on-chip SRAM, 40 PB/s aggregate SRAM bandwidth, 315 PFLOPS FP8 |
+| Per-chip (implied) | 500 MB SRAM, ~156 TB/s bandwidth, ~1.23 PFLOPS FP8 |
+| RealScale (per chip, secondary-sourced only) | 96 links × 112 Gbps ≈ 2.5 TB/s aggregate bidirectional |
+| Real-world precedent | 256-chip rack deployed for **Llama-3.3-70B at FP8** — same model family this project already uses |
+
+*Gen-1 LPU (superseded, kept as a fallback/cross-check — far more
+independently corroborated across sources than "3 LPX," but an older
+generation with an older precedent workload):*
+
+| Spec | Value |
+|---|---|
+| Per-chip | 230 MB SRAM, 80 TB/s bandwidth, 750 TOPS INT8 / 188 TFLOPS FP16, 14nm, 900MHz |
+| RealScale (per card) | 11 links × 30Gbps × 4 lanes ≈ 330 GB/s aggregate bidirectional |
+| Real-world precedent | ~576 chips (9 racks) for Llama-2-70B ([source](https://x.com/swyx/status/1759759125314146699)) |
+
+**Superseded consequence** (applied only to the rejected heterogeneous
+design, kept for the record): prefill (TPU 8i, Boardfly mesh) and decode
+(Groq, RealScale) would have sat on two different-vendor interconnect
+fabrics, forcing the prefill→decode KV handoff to cross between them — a
+concrete instance of spec Phase 2's "same fabric or dedicated?" question.
+Moot now that both pools are TPU 8i on the same Boardfly fabric throughout.
+
+### Precision — uniform FP4 throughout
+
+Reverted along with the chip decision — FP4/FP8 mixed precision (below,
+kept for the record) only existed to match Groq's own grounded precedent,
+which no longer applies once decode is TPU 8i too.
+
+**Final: FP4 uniformly, both pools.** Same precedent the MoE project already
+established for TPU 8i specifically (its native format) — now applies
+end-to-end since there's only one chip type in the system. No requantization
+mechanism at the prefill→decode handoff; KV cache moves at a consistent
+precision throughout.
+
+**Superseded reasoning** (applied only to the rejected heterogeneous design,
+kept for the record): the attention project used int8 uniformly
+(chip-agnostic), the MoE project used FP4 specifically because it's TPU 8i's
+native format — neither matched a Groq decode pool cleanly, which motivated
+mixed FP4 (TPU)/FP8 (Groq) and a real requantization-at-handoff mechanism
+(the same pattern as Phase 1a's P-matrix int8 requantization, just at an
+inter-chip boundary instead of an intra-chip HBM round-trip). Moot with
+homogeneous TPU 8i.
+
+---
+
+### Open threads carried forward from Phase 0
+
+- **Real eviction/placement policy for the intermediate pool** — deferred to
+  Phase 3 by design; only a "block until space frees" placeholder exists now.
+- **Interconnect fabric for prefill→pool→decode transfer**: same Boardfly
+  fabric the MoE project already uses, or a logically dedicated channel on
+  the same physical network? Spec Phase 2's question — simpler than the
+  cross-vendor version this was under the (rejected) Groq design, but still
+  open.
+- **Discrepancy** between raw ShareGPT corpus length stats (mean 56 / median
+  21) and DistServe's own benchmark numbers (512 / 64) — noted, not
+  reconciled; using DistServe's numbers for Phase 4 comparability.
+- **Prefill/decode step duration formulas** — not yet derived; needs the
+  attention project's FLOPs/roofline numbers plugged in (Phase 1/2).
+- **SRAM-only decode (Groq/Cerebras), take two** — tried and deliberately
+  reversed here (see Chip choice above) because it forces reworking Phase
+  0's "machine" abstraction into a multi-chip pipeline, which is out of
+  scope for a disaggregation/placement-focused project. Real, legitimate
+  material for a focused future project of its own — not lost, just correctly
+  not-this-project, the second time this exact idea has been flagged and
+  deliberately deferred rather than chased (first in `decode_notes.md`).
+
+---
