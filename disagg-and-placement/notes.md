@@ -1442,3 +1442,14 @@ pairs=8,388,608 → **5,577,015,033,856 FLOPs** (projections 87.68%, core
 reinforcing that the causal-discount question was never going to matter
 much).
 
+### 2b.14 Prefill FFN — same formula, bytes ceiling carries over unchanged
+
+FFN FLOPs formula is routing-mechanism-agnostic (doesn't care whether a
+token is from prefill or decode): `tokens×8×F_expert`. At
+tokens=16,384: **6,184,752,906,240 FLOPs** system-wide, **773,094,113,280
+FLOPs/device**. Bytes: §2b.2's saturation curve already showed ~100%
+coverage by N≈1,000–4,558 globally — prefill's 16,384 tokens sits
+comfortably past that, so the same **259.5MB/device ceiling from
+§2b.5/§2b.7 carries over directly**, no fresh distinct-experts-touched
+derivation needed.
+
