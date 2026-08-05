@@ -1562,3 +1562,94 @@ checked rather than assumed, and found two real things:
    answer is standard. Worth a one-line note for Phase 2c, not a design
    question to solve there.
 
+### 2b.18 Key Findings — Phase 2b (MoE chip ratio, complete)
+
+1. **Deployment model (replication vs. sharding) isn't a free simplification
+   — it determines whether MoE's bandwidth-sparsity story is real or an
+   artifact.** Under full replication, MoE moved *more* bytes than dense
+   (5.42×, §2b.3) — a genuinely misleading result caused entirely by the
+   deployment choice, not by MoE itself. Reversing to sharding (§2b.4)
+   restored the real, expected direction (0.70–0.73× dense, §2b.5/§2b.7) —
+   the same underlying MoE mechanism, opposite headline conclusion,
+   depending purely on an architectural choice this project got to make
+   freely (there was no memory-capacity forcing function either way,
+   unlike Groq in Phase 0).
+2. **At realistic batch sizes, MoE's per-device expert coverage saturates
+   almost completely — the "sparse routing saves bandwidth" story only
+   holds at small N.** Coupon-collector dynamics mean a device's local
+   22-expert shard gets touched by *someone* in the batch well before
+   N reaches this project's real capacity ceiling (90% coverage by N≈232;
+   99.4% by the properly-grounded N=640, §2b.2/§2b.7). Decomposing the
+   "MoE moves fewer bytes than dense" result showed **routing sparsity
+   itself contributes almost nothing (0.41 percentage points) — nearly
+   the entire effect is just the sharding-topology floor** (narrower
+   experts summing to less than dense's one big block), unrelated to
+   sparsity (§2b.6/§2b.7).
+3. **Reused numbers/formulas need re-verification for the *new* context,
+   not just formula reuse — this was the single most load-bearing
+   discipline in this phase, and it caught three separate real errors.**
+   T=8,192 (project #3's own batch) was silently ungrounded for capacity
+   purposes even though it came from a real project (§2b.7); the SDPA-only
+   attention scope was completely correct for the sibling attention
+   project's own question but silently incomplete once reused for
+   throughput modeling here, missing QKVO's real 21.4%-of-FFN cost in both
+   dense phases (§2b.11); DeepSeek-V2's real context length (163,840,
+   verified via HF config) was neither the borrowed 8,192 nor an invented
+   number (§2b.7). None of these were formula errors — all three were
+   *scope/context* mismatches, the harder kind to catch.
+4. **MLA trades bytes for FLOPs, and that trade makes attention genuinely
+   non-negligible for MoE** — unlike dense, where SDPA was consistently
+   <1–5% of service time. The absorption mechanism (§2b.8) that shrinks
+   MLA's KV-cache footprint adds real fixed per-token compute in exchange,
+   making decode attention compute-bound (3.17×, §2b.9) and prefill
+   attention's projections dominate even its own total (87.68%, §2b.13).
+5. **FFN's compute-bound crossover exists mathematically but is
+   unreachable at DeepSeek-V2's real capacity — "memory-bound in
+   practice," not "memory-bound-proof."** Crossover sits at N≈6,459
+   system-wide (§2b.9); real HBM capacity only supports N≈640–680 — an
+   order of magnitude short. A genuinely different flavor of memory-bound
+   than dense's imbalance-proof structural floor (`moe-routing-notes.md`
+   §2.2), worth keeping distinct in the write-up.
+6. **Sparsity cuts compute far more than it cuts the fixed weight
+   footprint, and that asymmetry is *why* MoE's crossover sits so much
+   higher (proportionally) than dense's** (§2b.10) — checked mechanistically,
+   not assumed: MoE's fixed bytes are 0.74× dense's, but its compute/token
+   is only 0.27× dense's; the ratio of those two ratios (2.75×) matches the
+   observed crossover-N ratio (2.73×) almost exactly.
+7. **The QKVO audit generalizes a lesson already learned once in this
+   project, one level up: it's not enough to check that a reused number
+   matches the new *workload* — it also has to match the new *use case*'s
+   scope.** SDPA-only was right for a microarchitecture question, wrong
+   (silently) for a throughput question. Fixing it moved dense's ratio a
+   real but bounded amount (~5.50→~5.82) — and *why* it was bounded despite
+   a real 21.4% correction is itself an Amdahl's-Law mechanism
+   (`prefill_notes.md`'s own named lesson, recurring for a different lever,
+   §2.9).
+8. **Naive vs. absorbed is a real architectural fork for MLA, resolved by
+   mechanism, not by reusing decode's formula for prefill.** Absorption
+   only pays off when avoiding *repeated* re-materialization across many
+   steps; prefill pays that cost once, so naive is correct there and
+   absorbed is correct for decode (§2b.12) — the same "check whether the
+   justification actually transfers" discipline as #3, applied to an
+   algorithmic choice instead of a number.
+9. **The final result — MoE's chip ratio (~1.31:1) is dramatically more
+   balanced than dense's (~5.82:1) — is a genuinely different disaggregation
+   *story*, not just a different number** (§2b.16). Dense's high ratio is
+   almost entirely a decode-batching windfall (N=320 crossing FFN into
+   compute-bound, a real 6.6× jump) that prefill never gets an equivalent
+   version of. MoE can't reach that same windfall at real capacity (its own
+   crossover is an order of magnitude beyond what HBM allows), while MoE's
+   prefill is independently cheaper from sparsity. Both effects push the
+   ratio the same direction — this directly and mechanistically answers
+   spec_v2's founding question ("does disaggregation work the same way once
+   you're serving MoE"): no, for a real, explainable reason, not just a
+   different coefficient.
+10. **The "flagged, not chased" discipline paid off cleanly at the close**
+    (§2b.17): one flagged item (per-device KV capacity under data-parallel
+    attention) turned out already resolved by earlier work; the other
+    (KV-handoff device targeting) turned out real but with an unsurprising,
+    well-understood answer (sticky-session load balancing) — not a hard
+    problem needing invention. Matches this project's own established
+    precedent that a boring, expected answer is still a real finding.
+
+---
