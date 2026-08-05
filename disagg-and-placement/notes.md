@@ -866,3 +866,39 @@ flagged as a future-project thread, the same "flagged, not chased" move
 already made twice for SRAM-only/Groq decode (see Phase 0's Chip choice
 section).
 
+### 2b.3 Effective FFN bytes moved per decode step, as a function of N
+
+`bytes/layer(N) = E[distinct(N)] × bytes_per_expert`, where
+`bytes_per_expert = 3×d_model×d_ff×0.5 = 3×5,120×1,536×0.5 = 11,796,480 B ≈
+11.80 MB` (FP4, SwiGLU gate/up/down — same per-expert formula project #3
+already established, reused not re-derived).
+
+| N | E[distinct] | MoE bytes/layer | vs. dense's flat 352.32 MB (§2.4) |
+|---|---|---|---|
+| 1 | 7.2 | 84.8 MB | 0.24× |
+| **8.71** | — | **352.3 MB** | **crossover — MoE passes dense's flat number here** |
+| 32 | 66.4 | 783.2 MB | 2.22× |
+| 232 (§2b.2's 90%-of-table point) | 145.8 | 1,719.6 MB | 4.88× |
+| **320 (this project's own decode-N)** | **153.5** | **1,810.6 MB** | **5.14×** |
+| ≥4,558 (saturated) | 162.0 | 1,911.0 MB | **5.42× (ceiling)** |
+
+**Finding, counter to the naive "sparse routing moves less data" intuition:
+MoE moves *more* bytes/layer than dense at every realistic N, not less.**
+Crossover happens almost immediately (N≈9 tokens) and plateaus at 5.42×
+dense's flat baseline. Mechanism: each individual expert is much narrower
+than dense's single FFN (`d_ff=1,536` vs. `28,672`, ~19× smaller per
+matrix), but there are 162 of them — the aggregate table (162×11.8MB≈1.91GB)
+dwarfs dense's single 352MB block by the same ~5.4× margin the saturated
+row shows. Sparse routing's payoff is relative to *not sharding at all*
+(touching 162 experts instead of some larger pool), never relative to
+dense's single-FFN cost — DeepSeek-V2's total FFN parameter budget
+(225.5B) is just much larger than Llama-3-70B's (56.4B) to begin with.
+
+**Sets up spec_v2 item 3 (regime crossover)**: MoE decode's memory-time is
+already far larger than dense's at any realistic N, while §2b.2's
+distinct-experts curve saturates by N≈232 — very little room left for
+further batching to buy a compute-bound crossover the way dense's did at
+N≈296. Next: convert this bytes curve into memory time, alongside MoE
+decode's own FLOPs (attention + FFN, following the 2.1–2.5 chain), to check
+whether a crossover exists at all.
+
