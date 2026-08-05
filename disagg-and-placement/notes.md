@@ -821,3 +821,48 @@ item 2): convert this distinct-count curve into effective FFN bytes moved
 per decode step as a function of N, to see how close "94.7% of the table"
 actually lands to dense's flat 352 MB/step baseline.
 
+### 2b.2b Deployment model — full replication, one TPU 8i chip, not expert-parallel sharding
+
+**Question raised**: `moe-routing-notes.md` deploys DeepSeek-V2 expert-parallel —
+160 routed experts sharded 20/device across an 8-device EP group, only 2
+shared experts replicated (source: lines 58–67). Does this project have to
+follow that, or is deployment model this project's own choice?
+
+**Checked first, not assumed**: does the *full* (unsharded) model actually
+fit on one TPU 8i chip? All 162 experts × 59 MoE layers + attention × 60
+layers ≈ 234.46B params (matches `moe-routing-notes.md`'s own ≈234.5B
+consistency check) ≈ **117.2 GB at FP4** — comfortably within TPU 8i's 288GB
+HBM (≈41% used, 170.8GB free for KV cache). Unlike Groq (500MB SRAM vs. 70GB
+Llama weights — categorically infeasible), there is **no memory-capacity
+forcing function** requiring sharding here. Sharding would be a choice, not
+a necessity.
+
+**Three deployment options weighed**:
+- **(A) Full replication, one atomic TPU 8i chip** — every prefill/decode
+  chip holds the full 162-expert table locally, zero dispatch/combine
+  traffic, routing is a pure local lookup.
+- **(B) Expert-parallel sharding, 8-device EP group** (project #3's own
+  model, as-is) — forces redefining "one decode machine" as an 8-chip group
+  acting together, the same abstraction-breaking shape that got the
+  Groq/heterogeneous design reversed in Phase 0. Requires reworking §2b.2 to
+  a per-device (n=20 local experts) version with its own token-arrival model.
+  The comms-cost question this reopens is already answered by project #3
+  (decisively compute-bound, 5.0–6.7× margin, imbalance-proof) — re-deriving
+  it here would mostly duplicate project #3's own work, not add new value.
+- **(C) Abstract a whole rack (NVL72/Hopper-8) as one compute unit** —
+  solves a problem that doesn't exist once (A) is confirmed feasible; also
+  reopens the exact heterogeneous-chip comparability problem the Groq
+  reversal avoided, and discards the TPU 8i/FP4/Boardfly continuity kept
+  since Phase 0 for no offsetting benefit.
+
+**Decided: (A), full replication on one atomic TPU 8i chip**, both pools.
+Reasoning: verified feasible (unlike Groq); preserves Phase 0's atomic
+decode-machine simulator abstraction exactly, so MoE plugs into the same
+entity model as dense per spec_v2's own design intent; avoids duplicating
+project #3's already-complete EP-sharding/comms analysis; keeps §2b.2's
+global (n=162) distinct-experts-touched computation directly valid rather
+than requiring a per-device rework. Sharding is real, legitimate material —
+flagged as a future-project thread, the same "flagged, not chased" move
+already made twice for SRAM-only/Groq decode (see Phase 0's Chip choice
+section).
+
