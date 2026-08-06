@@ -2508,3 +2508,58 @@ SRAM residency doesn't just improve throughput, it recovers almost the
 streaming" and "what the architecture is capable of once its own dominant
 memory bottleneck is removed." This is the direct, quantified answer
 `spec_v2`'s Phase 2b flagged as an open thread for Phase 3 to close.
+
+### 3.11 Key Findings — Phase 3 (complete)
+
+1. **Every KV-cache placement decision this phase made was already
+   implicitly decided upstream — the actual work was recognizing that, not
+   picking from scratch.** Hard-stop was already Phase 1's N=320 assumption;
+   hard-cap admission was already Phase 2's throughout; block-until-space-frees
+   was already Phase 0's placeholder. Phase 3's real job was checking each
+   one honestly rather than reflexively replacing it with something more
+   sophisticated.
+2. **Two independent sensitivity checks (dynamic admission, §3.3; KV
+   quantization's would-be capacity gain, §3.5) both hit the same
+   compute-bound-asymptote wall**: once decode is safely past its
+   compute-bound crossover, more concurrency headroom doesn't buy more
+   throughput or a different chip ratio — it buys lower admission queueing
+   time, a real benefit invisible to this project's own headline metrics.
+3. **The intermediate-pool "block until space frees" placeholder has a real,
+   non-free cost** (re-couples prefill to decode's pace under sustained
+   backpressure, partially undoing Mooncake's own decoupling rationale) —
+   kept anyway, but stated honestly rather than silently accepted, because
+   quantifying how often it actually binds needs the real simulator (Phase
+   4), and the real fix (tiered CPU/SSD offload) is a genuine scope
+   expansion this project's own philosophy pushes back on.
+4. **KV-cache quantization was declined for a precision-ripple reason more
+   severe than any other fork this phase** — every other Phase 3 decision
+   was a policy question layered on top of Phase 1's numbers; quantization
+   would have changed Phase 1's numbers themselves, retroactively, for every
+   later phase.
+5. **The hot-expert SRAM-residency question turned out to have a cleaner
+   answer than spec_v2 originally framed it**: not "which experts deserve
+   preferential ranking" but "does the entire local shard fit" — a direct
+   consequence of the EP-sharding deployment choice already made in Phase
+   2b (§2b.4), which nobody had connected back to the SRAM-residency
+   question until this phase.
+6. **A naive capacity check (weights vs. total SRAM) isn't sufficient by
+   itself — what else needs to be live in SRAM *simultaneously* matters just
+   as much**, and initially looked like a real blocker (§3.7's naive S/P
+   estimate). Resolved by checking real kernel behavior (FlashAttention)
+   rather than either assuming the naive estimate or assuming residency
+   would obviously work — the same "ground it in a real source, don't guess
+   either direction" discipline this project has used since Phase 0.
+7. **Hot-expert SRAM residency doesn't just add throughput — at real
+   deployment capacity, it recovers almost the entire architecture-level
+   chip ratio** (1.31:1 → ~5.97:1, matching the matched-cap comparison) —
+   directly resolving the open thread `spec_v2`'s Phase 2b section flagged
+   for this phase to close.
+8. **The "same throughput via two different routes" finding (§3.9) is the
+   same underlying mechanism as the dynamic-admission finding (§3.3),
+   discovered independently and only connected after the fact** — once a
+   system is compute-bound, throughput is a function of per-token cost and
+   peak hardware FLOPs/s alone; batch size and how you got to compute-bound
+   (big N vs. removing a fixed cost) stop mattering. A generalizable result
+   surfacing twice in one phase, from two unrelated starting questions.
+
+---
