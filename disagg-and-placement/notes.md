@@ -1864,3 +1864,46 @@ noticed but not corrected in either derivation. Likely a small effect
 given the KV-cache-read term dominates at real N, but a genuine modeling
 inconsistency worth resolving if this thread gets revisited.
 
+### 2b.23 MLA is a context-length-conditional trade, not a universal optimization — confirmed with real numbers at both ends
+
+**Question raised, in good faith skepticism**: if MLA reduces throughput
+at the matched 8,192 cap (§2b.20's hybrid beats MoE-matched), doesn't that
+contradict MLA's real-world reputation as a positive optimization?
+
+**Resolved by computing GQA-hybrid's decode at the REAL 163,840 cap**
+(not matched to 8,192) rather than asserting the resolution: capacity
+collapses to **N=36/device** (vs. MLA's 80) — GQA's bulkier cache can't
+support nearly as many concurrent requests once context gets that long.
+Both attention (10.7× MB) and FFN (22.3× MB) fall deep into memory-bound
+territory from being so batch-starved. **Throughput: 267.23 req/s/chip —
+MLA's real 601.55 wins by 2.25×.**
+
+| Context | GQA-hybrid decode | MLA decode | Winner |
+|---|---|---|---|
+| 8,192 (matched, short) | 2,991.63 | 2,735.03 | GQA, +9% |
+| 163,840 (real, long) | 267.23 | 601.55 | **MLA, +125%** |
+
+**MLA is not universally positive — it's a fixed architectural bet,
+calibrated for long context, evaluated honestly at both ends.** At short
+context, GQA's bytes were never a real problem, so paying MLA's compute
+tax buys nothing. At long context, GQA's bytes become catastrophic
+(crushes batch size, starves the chip) and MLA's compression becomes
+load-bearing rather than optional.
+
+**The closing mechanistic insight — MLA overcompensates, it doesn't just
+correct**: compare the regime margins directly. GQA's decode attention is
+3.58× memory-bound; MLA's is 3.17× compute-bound. The genuinely efficient
+point — neither compute nor memory idle — sits near a 1:1 ratio, at the
+crossover. GQA misses it one way; MLA doesn't land on it either, it
+overshoots straight through to the other side, comparably far in the
+opposite direction. **This is why the trade can't self-correct across
+regimes**: the absorption mechanism is baked into the model's weights and
+structure at training time, with no knowledge of what batch size or
+context length it'll actually be served at. It's a bet placed once, for
+one target regime — outside that regime, a fixed trade doesn't just help
+less, it can produce a worse tradeoff than what it replaced. Generalizable
+lesson, not specific to MLA: **any fixed architectural trade between two
+resources only pays off in the regime it was calibrated for; measuring it
+outside that regime can show it overshooting, not just underperforming.**
+
+---
