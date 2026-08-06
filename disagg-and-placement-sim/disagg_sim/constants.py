@@ -1,7 +1,7 @@
 """Hardware/model constants for the dense (Llama-3-70B, TPU 8i, FP4) leg.
 
-All values confirmed exact against disagg-and-placement/notes.md
-(SS1.3, SS2.2, SS2.9) during planning -- see that file for derivations.
+All values confirmed exact against ../disagg_and_placement_notes.md
+(SS1, SS2) -- see that file for derivations.
 """
 
 # Model (dense Llama-3-70B)

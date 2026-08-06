@@ -1,20 +1,21 @@
 # Phase 4 Simulator — Disaggregated Prefill/Decode Discrete-Event Sim
 
 Discrete-event simulator (SimPy) for the dense (Llama-3-70B, TPU 8i, FP4) leg
-of `disagg-and-placement/`. Answers the one thing Phases 1–3's closed-form
-math structurally can't: how often the finite intermediate KV pool actually
-hits capacity under bursty arrival, and what real admission-queueing latency
-looks like. Throughput/chip-ratio numbers are not re-derived here — they're
-inputs, taken from `../notes.md` §2.9, and used as regression-test targets.
+of [`disagg_and_placement_notes.md`](../disagg_and_placement_notes.md).
+Answers the one thing Phases 1–3's closed-form math structurally can't: how
+often the finite intermediate KV pool actually hits capacity under bursty
+arrival, and what real admission-queueing latency looks like.
+Throughput/chip-ratio numbers are not re-derived here — they're inputs, taken
+from `../disagg_and_placement_notes.md` §2 (post-QKVO-correction figures), and
+used as regression-test targets.
 
-Design rationale, formula derivations, and flagged assumptions all live in
-the plan this was built from (see repo history / conversation record) —
-this README is just setup + run instructions.
+Design rationale, formula derivations, and flagged assumptions are summarized
+in §4 of the notes doc above — this README is just setup + run instructions.
 
 ## Setup
 
 ```
-cd disagg-and-placement/sim
+cd disagg-and-placement-sim
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt

@@ -1,5 +1,5 @@
 """Regression tests pinning the two reference throughput numbers from
-disagg-and-placement/notes.md SS2.9 exactly. If these don't match, the
+../disagg_and_placement_notes.md SS2 exactly. If these don't match, the
 formula translation is wrong -- not the workload. Every other number in
 this simulator depends on these being right.
 """
