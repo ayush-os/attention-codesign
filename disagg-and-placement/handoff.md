@@ -22,10 +22,10 @@ historical record.
 
 ## Where things stand
 
-**Phase 0 through Phase 3 are all done.** Phase 4 (validate against
-DistServe/Mooncake) is next, untouched. Read [`notes.md`](notes.md) in full
-before doing anything — it's the actual record and this summary will go
-stale the moment more work happens. Headline state, so you don't have to
+**Phase 0 through Phase 4 are all done.** Phase 5 (full cross-project
+synthesis, the capstone) is next, untouched. Read [`notes.md`](notes.md) in
+full before doing anything — it's the actual record and this summary will
+go stale the moment more work happens. Headline state, so you don't have to
 read notes.md just to answer "what chip / what precision / what's the
 ratio / what's the placement policy":
 
@@ -128,6 +128,51 @@ ratio / what's the placement policy":
     routes (removing a fixed cost vs. brute-force batching past the
     crossover), the same asymptote mechanism the admission-policy
     sensitivity check hit independently.
+- **Phase 4 (validate, discrete-event simulator) — done, all numbers in
+  `notes.md` §4.1–§4.10**. Dense leg only (hard-cap admission, matching
+  §3.3's actual chosen policy) — MoE and a real dynamic-admission/eviction
+  model are legitimate follow-on passes, not built. Code in
+  [`sim/`](sim/) (SimPy, from scratch — no prior Python convention existed
+  in this repo). Both genuine unknowns `handoff.md` flagged for this phase
+  are now resolved:
+  - **Pool contention: essentially never happens at any realistically-
+    provisioned size.** The "one round" sizing anchor (worst-case
+    simultaneous full-batch completion across all 29 prefill machines,
+    ≈38.92GB) showed *exactly zero* contention across 2M+ requests —
+    confirmed real (not a wiring bug) via a deliberate tiny-pool (84MB)
+    control test that *did* collapse the system. The actual threshold sits
+    far below the original sizing logic: 500MB is unstable/bimodal, 1–2GB
+    carries small-but-real contention (~1%) only once arrival rate exceeds
+    the system's real ceiling, sub-1GB is where it becomes genuinely
+    dangerous. Refined across two exploration passes at increasing
+    statistical power — the picture sharpened, not reversed.
+  - **Dynamic admission (N≈4,558) vs. hard-cap (N=320): zero measurable
+    queueing benefit**, on top of §3.3's already-established zero
+    throughput benefit — because neither cap is ever actually the thing a
+    request waits on.
+  - **The real, previously-unidentified finding: the system's actual
+    bottleneck is prefill's fixed compute-bound throughput ceiling
+    (~4,138 req/s across the 29-machine pool), not decode capacity and not
+    the pool.** Decode occupancy plateaus under sustained overload
+    (self-limiting — bounded by how fast prefill can feed it, confirmed via
+    direct occupancy instrumentation) while prefill wait time grows
+    unboundedly under the same load — the real congestion signature, found
+    by building the simulator rather than assumed going in.
+  - Building the sim caught three real bugs before any result was trusted:
+    a wrong attention service-time formula in this project's own verbal
+    design discussion (prefill attention is actually marginally
+    compute-bound, not memory-bound — caught by a planning sub-agent,
+    independently re-verified bit-exact against `notes.md`'s own numbers),
+    a `simpy.Resource` race condition that could have silently over-admitted
+    past the decode cap, and a missing pool-release call that would have
+    made the pool monotonically fill and never drain.
+  - External validation against DistServe/Mooncake is partial, stated
+    honestly: the KV-handoff-latency claim was already checked analytically
+    in Phase 2c and stands; the throughput-multiplier/SLO-attainment
+    comparisons need a colocated-baseline simulator this pass explicitly
+    didn't build (flagged, not overlooked); order-of-magnitude latency
+    plausibility (the one thing checkable without a baseline) lands in a
+    believable regime.
 
 ## How this project actually works — read before doing anything
 
@@ -195,7 +240,22 @@ output is correct:
   `notes.md` write-up at the end instead (explicit user choice that
   session, not the default), then split it into several small,
   logically-scoped commits rather than one large one — matches this
-  project's "the more commits the merrier" preference when batching.
+  project's "the more commits the merrier" preference when batching. Phase
+  4 did the same — batched write-up at the end, explicit user choice again.
+- **Two different collaboration modes coexist, and Phase 4 is where this
+  became explicit** — the derivation-heavy phases (0–3) default to asking
+  the next sharpening question rather than completing the user's thought.
+  Phase 4's actual implementation work (writing the simulator) ran under a
+  different, explicitly-granted mode instead: "you code end-to-end, only
+  loop me in if there's actually something for me to learn or an
+  interesting decision." Real design/methodology forks (batching semantics,
+  pool-sizing derivation, what experiment to run next, whether a surprising
+  result is a bug or a finding) still got surfaced and discussed either way
+  — what changed was routine implementation (writing dispatcher code,
+  tests, debugging a race condition) proceeding without asking first.
+  Calibrate to which kind of work is actually in front of you, and don't
+  assume the quieter mode extends to judgment calls just because it was
+  granted for execution.
 
 ## Reading order for a new session
 
@@ -211,38 +271,40 @@ output is correct:
    repeatedly found real gaps in trusting these sibling projects' numbers at
    face value for its own purposes — reread the specific section being
    reused, not just the headline number.
+4. [`sim/`](sim/) (only if a specific Phase 4 number/mechanism needs
+   re-checking against the actual code, not by default) — `disagg_sim/`
+   for the entity model and formulas, `run_sweep.py`/`explore_*.py` for how
+   each sweep was actually run, `results/*.csv` for raw data behind
+   `notes.md` §4's numbers.
 
 ## Immediate next step
 
-**Phase 4**: validate — implement Phase 0's discrete-event simulator with
-Phase 2/3's hypotheses plugged in, then compare predicted latency/throughput
-against DistServe's/Mooncake's published results (order-of-magnitude sanity
-check, not exact reproduction). Per `spec_v2.md`'s own flagged caveat, say
-explicitly going in: DistServe and Mooncake are both dense-transformer
-systems (OPT-175B) — there's no equivalent public production-scale MoE
-disaggregation benchmark to check Phase 2b's MoE ratio against the way 2a
-was checked against DistServe's own direction. Phase 4's MoE-side validation
-will have to lean more on internal consistency (does the whole derivation
-chain — chip ratio, transfer cost, SRAM residency — behave sensibly
-together?) than external cross-checking. Say this explicitly rather than
-implying 2b/2c/3 got the same grade of external validation the dense leg
-did.
+**Phase 5 — full cross-project synthesis, the capstone.** Per `spec_v2.md`
+(supersedes `spec.md`'s three-legged version): the connective argument
+across all **four** pieces of derived evidence now in hand — attention
+(single-chip microarchitecture) → MoE routing (multi-chip interconnect) →
+this project's dense disaggregation leg → this project's MoE disaggregation
+leg. Given a fixed chip/power/area/bandwidth budget for a whole rack, how
+should it split across (a) on-chip SRAM for attention scratchpad/
+accumulator, (b) on-chip SRAM for hot MoE expert weights and KV cache, (c)
+interconnect bandwidth for MoE dispatch, (d) interconnect bandwidth for
+prefill→decode KV handoff. `spec_v2.md` flags one thing this synthesis owes
+a paragraph to on its own, independent of the rack-budget question: the
+dense-vs-MoE chip-ratio contrast from Phase 2 (§2.9's ~5.82:1 vs. ~5.97:1,
+nearly identical via two opposing effects that cancel) is a direct,
+quotable answer to "does disaggregation work the same way once you're
+serving a MoE model" — the question that motivated `spec_v2.md`'s existence
+in the first place.
 
-Two real, load-bearing unknowns Phase 3 flagged that Phase 4's simulator is
-specifically positioned to resolve (not open design questions — genuine
-"needs the real thing, not a formula" items):
+Real material now available for this synthesis that wasn't when spec_v2 was
+written: Phase 4 found the dense leg's actual bottleneck is prefill's
+compute-bound ceiling, not decode capacity or the KV pool (§4.7/§4.10) —
+worth checking whether that finding's shape (which resource is *actually*
+scarce vs. generously provisioned) generalizes to how the rack-budget
+question should be framed, rather than assuming SRAM/bandwidth are the only
+axes that matter.
 
-- **How often does the intermediate KV pool actually hit capacity** under
-  this project's own modeled load (Poisson, moderate)? Determines whether
-  the block-until-space-frees placeholder's real cost (§3.4) is
-  load-bearing in practice or mostly theoretical.
-- **What's the real admission-queueing-time benefit of dynamic admission**
-  vs. the hard-cap policy kept in §3.3? The throughput/ratio numbers came
-  back identical either way — the actual difference (if any) would show up
-  in queueing latency, which only exists once real request arrivals and
-  batch formation are simulated.
-
-Start by confirming with the user how they want to scope the actual
-implementation (full discrete-event sim per Phase 0's design, or a reduced
-version) — don't just start building, same pattern every phase so far has
-opened with.
+Start by confirming with the user how they want to scope the synthesis
+(a written argument only, per spec_v2's own description, or something with
+its own supporting derivation/validation) — don't just start writing, same
+pattern every phase so far has opened with.
