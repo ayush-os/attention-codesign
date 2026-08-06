@@ -48,25 +48,68 @@ ratio":
   correction — FFN's dominant share of each phase's own service time
   diluted the fix differently per phase).
 - **Phase 2b (MoE chip ratio, DeepSeek-V2 on TPU 8i) — done, headline
-  result**: **~1.31 prefill chips per decode chip** (`notes.md` §2b.16) —
-  dramatically more balanced than dense's ~5.82:1, and for a real,
-  mechanistic reason, not just a different coefficient: dense's high ratio
-  is almost entirely a decode-batching windfall (crossing FFN into
-  compute-bound at N=320) that MoE can't reach at its own real HBM capacity
-  (its crossover needs N≈807/device; capacity only supports N≈80/device),
-  while MoE's prefill is independently cheaper per chip from sparse
-  routing's lower compute/token. Both effects push the ratio the same
-  direction. Full derivation chain in `notes.md` §2b.1–§2b.18 (§2b.18 is the
-  Key Findings summary — read that first if short on time).
+  result went through two real corrections after the first pass, read
+  §2b.19–§2b.23 in order before trusting any single ratio number**: the
+  first-pass result (**~1.31 prefill chips per decode chip**, §2b.16),
+  using DeepSeek-V2's real 163,840-token context cap, turned out to be
+  **mostly a context-length artifact** — rerun at a cap matched to dense's
+  8,192 (§2b.19), the ratio came back **~5.97:1, essentially identical to
+  dense's ~5.82:1**. That looked like "architecture barely matters," but
+  §2b.20 decomposed it one level further and found **two real,
+  *opposing* architecture effects that happen to nearly cancel, not one
+  neutral effect**: swapping dense FFN → MoE's sparse FFN alone drops the
+  ratio 5.82→4.60 (prefill, always compute-bound, cashes in the full
+  compute savings; decode's dense FFN was already sitting right at its own
+  compute/memory crossover, so cutting compute further just pushes it
+  *across* into memory-bound instead of continuing to help). Swapping
+  GQA → MLA alone (holding FFN fixed) pushes the ratio back up 4.60→5.97
+  — nearly the exact opposite move. **The matched-cap "5.97 ≈ 5.82"
+  result is a coincidence of two real effects roughly offsetting, not
+  evidence that architecture doesn't matter.**
+  - **MLA itself is not "more expensive," it's a fixed trade — more FLOPs,
+    fewer bytes, everywhere (§2b.22)** — whether that trade helps depends
+    on which term (compute or memory) was already binding. Decode
+    attention gets strictly *worse* under MLA at short context (no
+    batch-size protection — compute is exactly as batch-invariant as
+    prefill's, a real conceptual error caught and corrected mid-derivation,
+    §2b.21/§2b.22) — decode's FFN independently gets *better* (genuine
+    fixed-cost amortization from MLA's smaller cache buying a bigger
+    batch), and the two partially cancel.
+  - **MLA is a context-length-conditional bet, not a universal
+    optimization — confirmed with real numbers at both ends (§2b.23)**:
+    loses to plain GQA by ~9% at the matched 8,192 cap, wins by **2.25×**
+    at DeepSeek-V2's real 163,840 cap (GQA's bytes become catastrophic at
+    real long context, collapsing its batch size to N=36/device). The
+    closing mechanistic insight: GQA overshoots one way (3.58× memory-bound),
+    MLA overshoots the *other* way (3.17× compute-bound) — neither lands at
+    the efficient crossover, because a fixed architectural trade baked in
+    at training time can't adapt to deployment regime. Generalizes beyond
+    MLA: any fixed resource trade only pays off in the regime it was
+    calibrated for.
+  - **Prefill's batch=32 was confirmed never capacity-derived (old, known
+    gap, §2.8) — checked properly, doesn't change any throughput number,
+    but explains why** (§2b.21): once compute-bound (which prefill always
+    is), throughput is provably invariant to batch size — work and time
+    scale together and cancel. Real, elegant side-finding: under
+    consistent worst-case-safe capacity math, prefill's own capacity-derived
+    batch size exactly equals decode's N, in every case checked — same
+    formula, no structural reason to differ.
   - **Deployment model: expert-parallel sharding** (8-device EP group per
     `moe-routing-notes.md`'s own real deployment), reversed from an initial
     full-replication choice after the replication numbers turned out
     structurally misleading (§2b.2–§2b.4). "One MoE decode machine" =
     one 8-chip EP group, not one atomic chip (dense stays single-chip).
-  - **Decode-N regrounded to 640** (not project #3's borrowed 8,192, not
-    the dense-derived 320) — DeepSeek-V2's own real shipped context length
-    (163,840, verified via HF config, not the borrowed 8,192) run through
-    this project's own 10–15% reserve convention (§2b.7).
+    Unaffected by later corrections.
+  - **Decode-N**: 640/system (80/device) at DeepSeek-V2's real 163,840 cap
+    (§2b.7); 12,864/system (1,608/device) at the matched 8,192 cap (§2b.19)
+    — MLA's KV cache being 4.74× more compact per token than dense's means
+    far more requests fit per device at any given cap.
+  - **Open, flagged item**: MLA's original §2b.9 decode-attention bytes
+    calc is missing a fixed weight-loading term (for its own down/up-
+    projection matrices) that the GQA-hybrid comparison's equivalent calc
+    does include — noticed in §2b.22, not corrected. Likely small (the
+    KV-cache-read term dominates at real N) but a genuine inconsistency,
+    worth resolving if this thread gets revisited.
   - **Prefill uses naive MLA (explicit K/V), decode uses absorbed** — a
     real architectural fork resolved by mechanism (absorption only pays off
     across *repeated* re-materialization; prefill pays that cost once,
