@@ -2439,3 +2439,72 @@ this project's sourcing.
 **This changes the shape of the whole question**: not a hot/cold
 expert-ranking problem after all — the entire local 22-expert shard can just
 stay SRAM-resident, permanently, no selection policy needed.
+
+### 3.8 Quantifying the residency payoff — depends entirely on which N
+
+**FFN's new service time (weights resident, no per-step HBM fetch) =
+FLOPs/device/layer ÷ TPU 8i peak (10.1×10¹⁵ FLOPs/s)**, memory term
+eliminated:
+
+| | FFN FLOPs/device/layer | New service (compute only) | Old service (streaming) | Old regime |
+|---|---|---|---|---|
+| Real cap (N=80/device) | 30,198,988,800 | 2.990 µs | 30.006 µs | Memory-bound, 10.04× |
+| Matched cap (N=1,608/device) | 606,999,674,880 | 60.10 µs | 60.10 µs | Already compute-bound, 1.99× |
+
+**At matched cap, residency changes nothing** — FFN was already
+compute-bound there (large N had already amortized the fixed memory cost
+past its crossover), so removing the memory term doesn't touch the `max()`.
+**At real cap, this is decisive** — FFN was memory-bound 10.04×; residency
+collapses its service time ~10×.
+
+**Recomputed full decode at real cap (N=80/device)**, attention unaffected
+(doesn't touch FFN weights, stays compute-bound at 4.627µs, §2b.9):
+
+```
+New combined/layer = 4.627 + 2.990 = 7.617 µs; × 60 layers = 457.0 µs/step
+Token throughput = 80 / 457.0µs ≈ 175,048 tok/s
+Request throughput = 175,048/64 ≈ 2,735 req/s/chip
+```
+
+**vs. the old real-cap streaming number, 601.55 req/s/chip — a ~4.5×
+throughput jump**, purely from SRAM-resident FFN weights.
+
+### 3.9 Why real-cap-with-residency lands on exactly the matched-cap number — the mechanism, checked not assumed
+
+**2,735 req/s/chip (real cap + residency) matches the matched-cap streaming
+throughput from §2b.19 (2,735.03) to three significant figures.** Checked
+whether this was a coincidence or a real mechanism, rather than just noting
+the match: **not a coincidence — the same compute-bound-asymptote mechanism
+already found independently in §3.3.**
+
+Once every component is compute-bound, `service_time = N × (FLOPs-per-token
+/ peak)` — a straight line through the origin — so
+`throughput = N / time = N / (N × FLOPs-per-token/peak) = peak /
+FLOPs-per-token`. **The N cancels algebraically.** Verified directly against
+the actual numbers: `N` ratio (1,608/80 = 20.1×) exactly matches both the
+FFN-FLOPs ratio (`606,999,674,880/30,198,988,800 = 20.1×`) and the
+combined/layer-time ratio (`153.11/7.617 = 20.1×`) — total work and total
+time scale identically, so the *rate* is invariant. **Matched-cap reaches
+the compute-bound ceiling via brute-force batching (N=1,608 pushes FFN past
+its crossover); SRAM residency reaches the identical ceiling at the real
+deployment's much smaller N=80 by removing the memory term outright — two
+different routes to the same destination**, not two coincidentally-similar
+numbers.
+
+### 3.10 Chip-ratio consequence — residency closes almost the entire real-cap gap
+
+Prefill's own FFN was already compute-bound at both caps (§2b.15) — its
+throughput (457.98 req/s/chip) is unaffected by decode-side residency
+either way.
+
+```
+New chip ratio, real cap + residency = 2,735 / 457.98 ≈ 5.97:1
+```
+
+**Up from the real-cap streaming ratio (1.31:1, §2b.16) to essentially the
+matched-cap architecture-comparison ratio (5.97:1, §2b.19)** — hot-expert
+SRAM residency doesn't just improve throughput, it recovers almost the
+*entire* gap between "what the real DeepSeek-V2 deployment achieves under
+streaming" and "what the architecture is capable of once its own dominant
+memory bottleneck is removed." This is the direct, quantified answer
+`spec_v2`'s Phase 2b flagged as an open thread for Phase 3 to close.
