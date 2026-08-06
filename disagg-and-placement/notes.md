@@ -2192,3 +2192,73 @@ doesn't need revisiting was the actual task.
     derivation.
 
 ---
+
+## Phase 3 — KV/Weight Placement Policy
+
+Scope per `spec.md` (unchanged in `spec_v2.md`): hypothesize a real
+eviction/placement policy for the KV cache (researching PagedAttention's
+paging, KV-cache quantization, attention-sink/sliding-window, CPU offload
+rather than inventing one), plus answer the hot-expert SRAM-residency
+question `moe-routing-notes.md` set up but never resolved. Both halves
+closed out this phase.
+
+### 3.1 Reference reading — the two techniques not already covered
+
+PagedAttention's paging and CPU-offload-via-swap were already read in Phase
+0. Pulled the other two fresh, from primary sources:
+
+**KV-cache quantization (KIVI, arXiv 2402.02750)**: not naive uniform
+quantize/dequantize. Real, sourced finding: Key and Value need **different**
+quantization granularity. Keys are quantized **per-channel** — a few fixed
+channels carry persistently large magnitude across every token (outlier
+channels), and per-channel quantization confines error to just those
+channels (per-token Key quantization: 47% relative attention-score error;
+per-channel: 9.6%, ~5× better). Values are quantized **per-token** instead
+— attention output is a sparse mixture of a few tokens' values, so per-token
+quantization localizes error to individual tokens rather than smearing it
+across the output (per-channel Value quantization: 49.89% output error;
+per-token: 3.55%, ~15× better). 2-bit is the paper's real deployed
+bit-width.
+
+**Attention sink (StreamingLLM, arXiv 2309.17453)**: naive sliding-window
+attention (evict oldest tokens once the window fills) causes catastrophic
+quality collapse, not graceful degradation, once the first few tokens are
+evicted — a mechanistic consequence of softmax normalization, not a content
+effect. Softmax weights must sum to 1; if nothing in the window is
+semantically relevant at a given step, the model still has to put that mass
+*somewhere*, and because the first tokens are visible to every later
+position under causal training, the model learns to route "excess"
+attention there as a no-op sink. Removing them "eliminates a considerable
+portion of the denominator in the SoftMax function," shifting the whole
+attention distribution out of the regime the model was trained in.
+**Fix: keep exactly 4 initial tokens permanently resident**, combined with a
+normal sliding window over recent tokens — a refinement *on top of* sliding
+window, not a competing technique. Enables streaming up to 4M tokens with no
+fine-tuning, up to 22.2× speedup over recomputation baselines.
+
+### 3.2 Cap behavior — hard stop, not compaction/sliding-window
+
+**The fork** (flagged since Phase 1 §1.5): what happens to one request when
+its own conversation would exceed the 8,192-token per-request cap — hard
+stop (matches real chatbot behavior), or compaction/sliding-window (matches
+coding-agent-style unbounded sessions)?
+
+**Decided: hard stop.** Two real reasons, not just simplicity:
+
+1. **It's not actually a new decision — it's the assumption already baked
+   into every number since Phase 1.** §1.5 states directly: N=320-339 was
+   derived against "a hard per-request context-length cap of 8,192 tokens."
+   Picking compaction now would mean reopening whether that entire
+   downstream chain (all of Phase 2a/2b/2c) still means what it says, not
+   layering a Phase 3 policy on top of it.
+2. **It matches this project's own modeled workload.** Compaction solves
+   unbounded-length sessions; this project has modeled DistServe-anchored
+   chatbot traffic since Phase 0 (Poisson arrivals, ~576-token average
+   request). The 8,192 cap sits **~14× above that average** — a
+   worst-case-safe capacity bound almost no real request in this workload
+   would approach, not a wall the traffic routinely hits.
+
+Attention-sink's mechanism is real and worth a paragraph in any final
+write-up as the right answer for a *different* workload shape (coding-agent
+sessions) this project didn't model — not wasted reading, just correctly
+not adopted here.
