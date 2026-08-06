@@ -2338,3 +2338,104 @@ tradeoff explicitly rather than silently accept it.** Two reasons:
    new memory tier (bandwidth, latency, page-in/out cost) this project has
    never touched — a real scope expansion, the exact kind of thing spec's
    own scope note warns against turning one focused question into.
+
+### 3.5 KV-cache quantization / CPU-offload — declined, reasons stated
+
+**CPU-offload**: already resolved by §3.4's reasoning — declined for the
+same scope-expansion reason.
+
+**KV-cache quantization below FP4** (e.g. KIVI's 2-bit, §3.1): real,
+well-published, and specifically well-suited to KV cache — but declined for
+two real reasons, not dismissed casually:
+
+1. **KV-cache-bytes/token is load-bearing in literally every number derived
+   since Phase 1** — N=320, every Phase 2a/2b memory-time figure, both
+   Phase 2c transfer-cost numbers. Changing the precision assumption now
+   means re-touching that entire chain, a far bigger ripple than the
+   admission-policy fork.
+2. **It reintroduces a complexity this project already explicitly
+   declined once** — the Groq/heterogeneous reversal in Phase 0 rejected
+   mixed FP4/FP8 specifically because it needed "a real requantization
+   mechanism... at an inter-chip boundary." Storing KV cache below FP4 while
+   computing attention in FP4 means dequantizing on every attention read —
+   the same requantization-boundary cost, just moved from a chip boundary
+   to a compute boundary.
+
+**Noted for free, not computed**: even if adopted, lower-bit KV cache would
+roughly double capacity/N the same way dynamic admission did (§3.3) — and
+decode is already comfortably past its compute-bound crossover at N=320, so
+by the identical asymptote argument, more KV-cache headroom wouldn't move
+throughput/chip or the chip ratio either. One sentence, not a
+recomputation.
+
+**Decided: flag both as real, published, future-work material** (same
+"flagged, not chased" treatment as Groq and full weight-replication in
+earlier phases) — not adopted into this project's own hypothesis.
+
+### 3.6 Hot-expert SRAM residency — first pass: does the local shard even fit?
+
+**Reframed before computing anything**: under the EP-sharded deployment
+already chosen (§2b.4), "how many experts could be resident" isn't a
+question about the global 162-expert table — each device only ever holds a
+**local shard of 22 experts** (20 routed + 2 shared, §2b.5/§2b.6). So the
+real first question is capacity, not ranking:
+
+```
+22 experts × 11.8 MB/expert (§2b.3) = 259.5 MB
+TPU 8i SRAM = 384 MB
+```
+
+**259.5 MB already fits under 384 MB, with 124.5 MB headroom** — before
+accounting for anything else SRAM has to hold. Full weight residency was
+already ruled out earlier in this phase for both architectures at the
+*global* scale (dense: 35 GB, ~91× too big; MoE full table: 117.2 GB, ~305×
+too big) — but under EP-sharding, the *local* shard is a completely
+different, much smaller number, and this comparison suggested the
+hot/cold-ranking framing from spec_v2 might not even be necessary — the
+whole local shard might just fit.
+
+### 3.7 Checking whether it actually fits — naive estimate said no, real kernel behavior said yes
+
+**Correctly refused to accept "124.5 MB headroom" as sufficient without
+checking what else needs that room.** During an actual decode step, SRAM
+also has to hold whatever transient attention compute state is live —
+established for dense back in Phase 1 §1.3 (S/P softmax intermediates live
+in SRAM under the fused execution model), never rederived for MLA.
+
+**Naive (materialize-the-whole-batch) estimate, worked through in full**:
+MLA's absorbed decode produces one score per head per cached position (not
+full per-head K/V vectors — that's the point of absorption), so per request:
+`S shape = n_h × seq_k = 128 × 544 = 69,632 elements` (P is the same shape).
+At N=1,608/device (matched-cap decode-N, §2b.19): `S ≈ 56.0 MB`, `P ≈ 56.0
+MB`. Cross-checked the methodology against dense (`64 heads × 320 concurrent
+× 544 context ≈ 5.57 MB`, matching Phase 1's "negligible" call exactly) —
+confirmed the *method* was right; MoE's number is ~10× dense's purely
+because N is 5× bigger (1,608 vs. 320 — MLA's smaller KV cache is *why* N
+could grow that much) and `n_h` is 2× bigger (128 vs. 64), not a modeling
+error. **P-only (optimistic): 68.5 MB headroom left. S+P together
+(conservative): 12.5 MB left** — before even counting the per-head latent
+buffers (absorbed query, weighted-sum output, ~52.7 MB each) a real kernel
+might also need live, which would blow past budget in the conservative case.
+**Genuinely tight, not a clean "obviously fits."**
+
+**Resolved by checking real fused-kernel behavior instead of guessing**:
+pulled FlashAttention directly (arXiv 2205.14135). Real fused attention
+kernels do **not** materialize the whole batch's scores in SRAM at once —
+they tile K/V and process **sequentially**, reusing one small, fixed SRAM
+buffer across tiles and across the batch: *"Load Kj, Vj from HBM to on-chip
+SRAM... for 1≤i≤Tr: Load Qi, Oi, ℓi, mi from HBM to on-chip SRAM."* SRAM
+footprint is bounded by **tile size**, not by `N × seq_k` — the entire
+premise behind my naive estimate (hold every concurrent request's full score
+matrix simultaneously) doesn't match how any real kernel works.
+
+**Conclusion: the 22 experts do fit, comfortably** — the naive tight-fit
+finding was an artifact of an incorrect execution model, not a real
+constraint. One honest caveat: confirmed the *qualitative* mechanism
+(tile-bounded, sequentially reused, not batch-scaled) directly from the
+paper; didn't extract an exact numeric tile-size formula for TPU 8i
+specifically, so this is solid but slightly lower-precision than the rest of
+this project's sourcing.
+
+**This changes the shape of the whole question**: not a hot/cold
+expert-ranking problem after all — the entire local 22-expert shard can just
+stay SRAM-resident, permanently, no selection policy needed.
