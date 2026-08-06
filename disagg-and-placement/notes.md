@@ -1806,3 +1806,61 @@ independent of what the batch number actually is." Decode's lever exists
 specifically because decode *can* be memory-bound, which depends on
 architecture, not just on having a bigger number.
 
+### 2b.22 MLA is not "more expensive everywhere" — it's more FLOPs, fewer bytes, everywhere, and which one binds depends on regime
+
+**Imprecision caught and corrected**: "MLA makes attention more expensive
+everywhere" (used loosely in conversation) is wrong as stated. Precise
+version: **MLA costs more FLOPs per token in both phases** (2.65× prefill
+at matched token count, 4.52× decode) **and fewer bytes per token in both
+phases** (17,280 vs. GQA-hybrid's 38,400, 2.22× smaller) — a real trade,
+not a uniform cost increase. Whether the trade helps or hurts throughput
+depends entirely on which term — compute or memory — was already binding
+before the swap.
+
+**Decode attention, isolated, per token** — the clearest way to see the
+mechanism:
+
+| | Compute/token | Memory/token | Bottleneck | Cost/token |
+|---|---|---|---|---|
+| GQA | 0.0128 µs | 0.0458 µs | Memory | **0.0458 µs** |
+| MLA | 0.0578 µs | 0.0182 µs | Compute | **0.0578 µs** |
+
+Memory got cheaper (0.0458→0.0182, real). Compute got more expensive by
+more (0.0128→0.0578). Cost/token is `max(compute,memory)`, not the sum —
+under GQA memory was the bigger number and set the pace; under MLA,
+memory shrank but compute grew past it and become the new bigger number.
+The byte savings don't help once bytes stop being what's binding — net
+cost/token rises ~26%, matching the isolated-attention throughput drop
+measured directly (see below).
+
+**A bigger batch does not protect attention's cost — checked directly
+after catching a real conceptual error mid-conversation** (initially
+described decode's smaller net hit as "the bigger batch spreads the FLOPs
+cost" — wrong; compute scales exactly linearly with N, so it's exactly as
+batch-invariant as prefill's, no protection available). Isolated
+component throughputs, GQA(N=731) vs. MLA(N=1,608):
+
+| | GQA | MLA | Change |
+|---|---|---|---|
+| Attention alone | 364,138 tok/s | 288,150 tok/s | **−20.9%** |
+| FFN alone | 403,769 tok/s | 445,931 tok/s | **+10.4%** |
+
+**Attention gets strictly worse under MLA, with zero batch-size
+protection** — same mechanism as prefill, matches the ~26% per-token cost
+increase above. **FFN gets strictly better** — not because MLA's FFN cost
+changed (it didn't, FFN is attention-agnostic), but because MLA's smaller
+KV cache buys a bigger batch (N=1,608 vs. 731), and FFN's weight-loading
+bytes are a genuinely *fixed, N-independent* cost (259.5MB, loaded once
+regardless of N) that benefits from amortization over more tokens —
+attention has no equivalent fixed term to amortize in this model. Decode's
+modest net 8.6% hit is these two real, opposing effects partially
+canceling, not FLOPs being "spread" or "hidden."
+
+**Open item, flagged not resolved**: this asymmetry (GQA-hybrid's decode
+attention bytes calc includes a fixed QKVO weight-loading term; MLA's
+original §2b.9 decode attention bytes calc does not include an equivalent
+fixed weight-loading term for its own down/up-projection matrices) was
+noticed but not corrected in either derivation. Likely a small effect
+given the KV-cache-read term dominates at real N, but a genuine modeling
+inconsistency worth resolving if this thread gets revisited.
+
