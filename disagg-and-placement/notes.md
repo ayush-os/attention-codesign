@@ -2066,3 +2066,61 @@ the worst case (3 hops × 936.25ns ≈ 2.81µs added) only brings dense to
 doubles the pure-bandwidth number** (3.69µs → 6.50µs) — real, but still
 low-single-digit microseconds in absolute terms.
 
+### 2c.8 DistServe sanity check — reusing 2a/2b's own decode-step durations directly
+
+**No new derivation needed** — both denominators already existed in
+`notes.md`: dense's decode-step time (6.020ms, N=320, post-QKVO-fix, §2.9)
+and MoE's matched-cap decode-step time (9.186ms, N=1,608/device, §2b.19).
+
+| | Handoff time | Decode step | Fraction |
+|---|---|---|---|
+| Dense (1–3 hops) | 17.48–20.3 µs | 6.020 ms | 0.29%–0.34% |
+| MoE (1–3 hops) | 3.69–6.50 µs | 9.186 ms | 0.040%–0.071% |
+
+**MoE clears DistServe's own reported `<0.1%-of-total-latency` bar outright.
+Dense sits modestly above it** (0.29–0.34% vs. DistServe's <0.1%) — but this
+isn't read as a real discrepancy: DistServe's figure was measured against
+**total end-to-end request latency** (one prefill pass + the full ~64-step
+decode phase), a much larger denominator than a single decode step. A
+single-step comparison is deliberately the *stricter* test.
+
+### 2c.9 Chose not to build full end-to-end latency — a real scope call, not a shortcut
+
+**Considered, explicitly, and declined.** Two reasons, not one:
+
+1. **Real end-to-end latency isn't a closed-form quantity here.** Prefill
+   throughput is batch-invariant (§2b.21), but an individual *request's*
+   prefill latency isn't — it has to wait for its whole batch to finish
+   processing together, which depends on real queueing/batch-formation
+   behavior (how batches actually fill as requests arrive). That's precisely
+   what Phase 0's discrete-event simulator exists to model; hand-deriving it
+   with a formula would either approximate it sloppily or quietly rebuild a
+   piece of Phase 4 ahead of schedule.
+2. **The missing rigor can only help, never hurt, the conclusion.** A single
+   decode step is the smallest possible denominator in the system — moving
+   to the true multi-step total latency can only shrink both fractions
+   further, never grow them. There's no scenario where "negligible against
+   one step" flips to "not negligible against the full request." A one-sided
+   risk, and therefore not worth spending time on now — the real,
+   simulator-backed comparison is Phase 4's job regardless.
+
+**Mechanism worth keeping precise in the eventual write-up**: transfer cost
+being cheap isn't *why* disaggregation helps — per DistServe's own Phase 0
+finding, colocation hurts because of **interference** (a single prefill
+request injected into a decode batch inflates batch time 60ms→200ms), not
+transfer overhead. Cheap KV transfer is what keeps physically separating the
+pools from *giving back* that interference-avoidance win — a necessary
+condition for disaggregation not to backfire, not the reason to disaggregate
+in the first place. Two distinct claims, both real, worth stating separately.
+
+### 2c.10 MoE device-targeting — already resolved, not new work
+
+Spec_v2 flagged this as a possible new decision surface for MoE (dense's
+single-chip handoff never had a destination to choose; MoE's 8-chip EP
+group, data-parallel attention, means a specific device has to be picked).
+**Already closed out during Phase 2b's own wrap-up, §2b.17** — sticky-session
+load balancing, shared queue, pull-on-a-free-slot among each device's
+concurrent-request capacity (~80/device at the real cap, ~1,608/device at
+the matched cap used here). Nothing new to derive in 2c; confirming it
+doesn't need revisiting was the actual task.
+
