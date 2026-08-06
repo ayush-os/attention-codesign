@@ -1766,3 +1766,43 @@ effect. This is why §2b.19's bundled matched-cap result (5.97) landed so
 close to dense (5.82): not because neither architecture change mattered,
 but because they move the ratio in opposite directions and mostly offset.
 
+### 2b.21 Prefill's batch=32 was never capacity-derived — checked, doesn't change any numbers, but explains why
+
+**Question raised**: `notes.md` §2.8 already flagged prefill's batch=32
+as an inherited default, never re-derived from this project's own capacity
+math the way decode's N was. Does fixing that change any of §2b.20's
+numbers?
+
+**Capacity-derived, worst-case-safe (same methodology as decode's own N,
+not the earlier average-case seq_len=512 version — that version gave
+wildly larger, unsafe numbers like 5,127 for dense, corrected here to use
+each model's own real native/shipped cap instead)**: computed for all four
+cases. **Striking, exact result: prefill's own worst-case-safe capacity
+equals decode's own N, in every single case** (dense: 320=320; hybrid:
+731=731; MLA-real: 80=80; MLA-matched: 1,608=1,608). Not a coincidence —
+it's the literal same formula (`usable HBM / (KV bytes/token × worst-case
+cap)`), same weight footprint, same KV format, same cap, same reserve,
+for both phases. There was never a structural reason for prefill and
+decode to have different capacity-derived batch sizes.
+
+**Recomputed prefill throughput at the corrected batch size for all four
+cases — every number came back identical to what §2b.20 already had**
+(after finding and fixing a real bug in the first attempt — accidentally
+reused MoE's sparse-FFN formula for dense's own recomputation, caught by
+the result changing when it shouldn't have). **Confirmed mechanism**: once
+a workload is comfortably compute-bound — which prefill always is, in
+every case checked — per-request throughput is *invariant to batch size*,
+because work and time both scale linearly with N and cancel in the ratio.
+Verified directly: dense prefill throughput is 142.69 req/s at both
+batch=32 and the corrected batch=320.
+
+**So the batch=32 gap was real (worth fixing on principle, now documented
+properly) but not load-bearing for any throughput number** — the deeper,
+correct reason prefill can't offset MLA's extra cost isn't "its batch
+happens to be small," it's "prefill is intrinsically compute-dominated
+(seq_len² attention, full-model FFN traversal every token) and therefore
+has no regime to flip into regardless of batch size — no lever exists,
+independent of what the batch number actually is." Decode's lever exists
+specifically because decode *can* be memory-bound, which depends on
+architecture, not just on having a bigger number.
+
