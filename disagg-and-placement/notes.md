@@ -2262,3 +2262,79 @@ Attention-sink's mechanism is real and worth a paragraph in any final
 write-up as the right answer for a *different* workload shape (coding-agent
 sessions) this project didn't model — not wasted reading, just correctly
 not adopted here.
+
+### 3.3 Hard-cap vs. dynamic admission — hard-cap kept, sensitivity computed
+
+**The fork** (Phase 1 §1.5's other open item): N=320 assumes every
+concurrent decode slot could simultaneously hold a full 8,192-token request
+(worst-case-safe, static). Dynamic, usage-tracked admission would instead
+size N off each request's *real*, currently-grown KV-cache footprint — since
+the average request is far shorter than the cap, this supports **~4,558
+concurrent requests at the 15% reserve** (§1.5) — **~14× more** than N=320.
+
+**Decided: keep hard-cap (N=320-family).** Real production systems
+(vLLM/PagedAttention, per Phase 0's own reading) do exactly this kind of
+dynamic tracking — but Phase 0 already explicitly declined full
+continuous-batching complexity as serving a different question than this
+project's own (chip ratio, handoff cost, placement policy). Dynamic
+admission also needs a real backpressure policy for when a burst of
+longer-than-average requests overflows what was provisioned — genuine
+queueing/discrete-event behavior, Phase 4's job (same "needs the simulator,
+not a closed-form estimate" position already taken in Phase 2c), not a
+closed-form Phase 3 addition.
+
+**Sensitivity computed anyway** (cheap — reused Phase 2's own per-layer
+formulas, just swapped N; this closes out §1.5's own flagged-but-never-run
+"~4,558 scenario"):
+
+| | N=320 | N=4,558 |
+|---|---|---|
+| Attention service (memory-bound, linear in N) | 21.03 µs | 299.59 µs |
+| FFN service (compute-bound past crossover) | 44.65 µs | 636.03 µs |
+| QKVO service (compute-bound past crossover) | 9.57 µs | 136.32 µs |
+| Combined/layer | 75.25 µs | 1,071.94 µs |
+| Request throughput/chip | 830.59 | 830.5 |
+
+**Essentially identical — the ~14× capacity headroom doesn't translate into
+~14× more throughput.** N=320 already sits comfortably past FFN's and
+QKVO's compute-bound crossover (~296, §2.5); once past that, `combined/layer`
+is purely linear in N, so `throughput = N/(layers × combined/layer)` cancels
+N entirely — a flat asymptote (the same mechanism §3.9 below hits again,
+independently, for the SRAM-residency question). **Chip ratio at N=4,558:
+`830.5/142.70 ≈ 5.82`** — unchanged to three significant figures. Dynamic
+admission's real benefit here would be lower *admission queueing time*, not
+higher steady-state throughput or a different ratio — a real win, just not
+one visible in this project's own headline metrics, and one that (like the
+full end-to-end-latency question in Phase 2c) needs the real simulator to
+quantify properly.
+
+### 3.4 Intermediate-pool eviction — block-until-space-frees kept, real cost flagged
+
+**The question**: Phase 0's placeholder for what happens when the
+intermediate KV pool fills was "block until space frees" — is that the real
+Phase 3 policy, or does it need replacing?
+
+**Real mechanistic cost, traced through rather than assumed away**: this
+project's pool exists specifically to *decouple* prefill throughput from
+decode's pace (Mooncake-style handoff, not DistServe's pull-model). Making
+the prefill machine stall when the pool is full silently re-couples them
+under sustained backpressure — prefill throughput starts tracking decode's
+consumption rate again, exactly what the separate pool was built to avoid.
+Not free, even though it's simple.
+
+**Real published alternative** (Mooncake's own actual design, already read
+in Phase 0, never applied here): tiered offload — push cold KV blocks to
+CPU/SSD instead of blocking the sender, rather than the pool's fast tier
+being the only option.
+
+**Decided: keep block-until-space-frees as the real policy, flag the
+tradeoff explicitly rather than silently accept it.** Two reasons:
+
+1. How often the pool would actually hit capacity under this project's own
+   modeled load (Poisson, moderate) is genuinely unknown without the real
+   discrete-event simulator — can't tell if this decision is even
+   load-bearing in practice without Phase 4.
+2. Building real tiered CPU/SSD offload means characterizing an entirely
+   new memory tier (bandwidth, latency, page-in/out cost) this project has
+   never touched — a real scope expansion, the exact kind of thing spec's
+   own scope note warns against turning one focused question into.
