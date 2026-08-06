@@ -1,10 +1,10 @@
 # Handoff — read this first in a new conversation
 
-Written because the conversation that produced Phase 2b got long enough to
-need a fresh chat. This file's only job is to get a new session oriented
-fast and working the same way the old one did. It is not a project doc —
-nothing here should get cited from `notes.md`; if something here turns out
-to matter long-term, it belongs in `notes.md`, not here.
+Written because the conversation that produced Phase 2c and Phase 3 got
+long enough to need a fresh chat. This file's only job is to get a new
+session oriented fast and working the same way the old one did. It is not
+a project doc — nothing here should get cited from `notes.md`; if something
+here turns out to matter long-term, it belongs in `notes.md`, not here.
 
 ## What this is
 
@@ -16,18 +16,18 @@ underneath both: given a serving system split into prefill and decode
 pools, what actually lives in SRAM vs. HBM vs. gets transferred, and how
 does data move as prefill hands off to decode. Original spec:
 [`spec.md`](spec.md). **Superseded/extended by
-[`spec_v2.md`](spec_v2.md)**, which adds the MoE leg (Phase 2b) this
-session just finished — read `spec_v2.md`, not `spec.md`, for the current
-plan; `spec.md` stays as historical record.
+[`spec_v2.md`](spec_v2.md)**, which adds the MoE leg (Phase 2b) — read
+`spec_v2.md`, not `spec.md`, for the current plan; `spec.md` stays as
+historical record.
 
 ## Where things stand
 
-**Phase 0, Phase 1, Phase 2a, and Phase 2b are all done.** Phase 2c (KV
-handoff mechanism) is next, untouched. Read [`notes.md`](notes.md) in full
+**Phase 0 through Phase 3 are all done.** Phase 4 (validate against
+DistServe/Mooncake) is next, untouched. Read [`notes.md`](notes.md) in full
 before doing anything — it's the actual record and this summary will go
 stale the moment more work happens. Headline state, so you don't have to
 read notes.md just to answer "what chip / what precision / what's the
-ratio":
+ratio / what's the placement policy":
 
 - **Simulator design** (Phase 0): discrete-event. Prefill machines, decode
   machines, one finite intermediate KV pool. Mooncake-style handoff (prefill
@@ -38,82 +38,96 @@ ratio":
   in Phase 0 (real reasoning kept in `notes.md`, not scrubbed).
 - **Phase 1 (dense, Llama-3-70B)**: weights = 35GB; KV cache = 81,920
   bytes/token; N ≈ 320–339 concurrent max-length (8,192-token) requests/chip.
-- **Phase 2a (dense chip ratio) — corrected mid-Phase-2b, this is the
-  authoritative number**: **~5.82 prefill chips per decode chip**
-  (`notes.md` §2.9), not the earlier ~5.50 — a real audit found dense's
-  attention numbers (reused from `prefill_notes.md`/`decode_notes.md`) were
-  explicitly SDPA-only, missing QKVO projection FLOPs/bytes (21.4% of FFN's
-  magnitude) throughout. Fixed, logged, mechanistically explained (an
-  Amdahl's-Law-shaped reason the ratio moved only a little despite a real
-  correction — FFN's dominant share of each phase's own service time
-  diluted the fix differently per phase).
-- **Phase 2b (MoE chip ratio, DeepSeek-V2 on TPU 8i) — done, headline
-  result went through two real corrections after the first pass, read
-  §2b.19–§2b.23 in order before trusting any single ratio number**: the
-  first-pass result (**~1.31 prefill chips per decode chip**, §2b.16),
-  using DeepSeek-V2's real 163,840-token context cap, turned out to be
-  **mostly a context-length artifact** — rerun at a cap matched to dense's
-  8,192 (§2b.19), the ratio came back **~5.97:1, essentially identical to
-  dense's ~5.82:1**. That looked like "architecture barely matters," but
-  §2b.20 decomposed it one level further and found **two real,
-  *opposing* architecture effects that happen to nearly cancel, not one
-  neutral effect**: swapping dense FFN → MoE's sparse FFN alone drops the
-  ratio 5.82→4.60 (prefill, always compute-bound, cashes in the full
-  compute savings; decode's dense FFN was already sitting right at its own
-  compute/memory crossover, so cutting compute further just pushes it
-  *across* into memory-bound instead of continuing to help). Swapping
-  GQA → MLA alone (holding FFN fixed) pushes the ratio back up 4.60→5.97
-  — nearly the exact opposite move. **The matched-cap "5.97 ≈ 5.82"
-  result is a coincidence of two real effects roughly offsetting, not
-  evidence that architecture doesn't matter.**
-  - **MLA itself is not "more expensive," it's a fixed trade — more FLOPs,
-    fewer bytes, everywhere (§2b.22)** — whether that trade helps depends
-    on which term (compute or memory) was already binding. Decode
-    attention gets strictly *worse* under MLA at short context (no
-    batch-size protection — compute is exactly as batch-invariant as
-    prefill's, a real conceptual error caught and corrected mid-derivation,
-    §2b.21/§2b.22) — decode's FFN independently gets *better* (genuine
-    fixed-cost amortization from MLA's smaller cache buying a bigger
-    batch), and the two partially cancel.
+- **Phase 2a (dense chip ratio) — authoritative number**: **~5.82 prefill
+  chips per decode chip** (`notes.md` §2.9) — corrected mid-Phase-2b after a
+  real audit found dense's attention numbers were SDPA-only, missing QKVO
+  projection FLOPs/bytes (21.4% of FFN's magnitude) throughout.
+- **Phase 2b (MoE chip ratio, DeepSeek-V2 on TPU 8i)** — two real corrections
+  after the first pass, read `notes.md` §2b.19–§2b.23 in order before
+  trusting any single ratio number:
+  - First-pass result (**~1.31 prefill chips per decode chip**, §2b.16),
+    using DeepSeek-V2's real 163,840-token context cap, turned out to be
+    **mostly a context-length artifact** — rerun at a cap matched to dense's
+    8,192 (§2b.19), the ratio came back **~5.97:1, essentially identical to
+    dense's ~5.82:1**. §2b.20 decomposed this further: swapping dense FFN →
+    MoE's sparse FFN alone drops the ratio 5.82→4.60; swapping GQA → MLA
+    alone pushes it back 4.60→5.97 — two real, *opposing* effects that
+    nearly cancel, not one neutral effect.
   - **MLA is a context-length-conditional bet, not a universal
-    optimization — confirmed with real numbers at both ends (§2b.23)**:
-    loses to plain GQA by ~9% at the matched 8,192 cap, wins by **2.25×**
-    at DeepSeek-V2's real 163,840 cap (GQA's bytes become catastrophic at
-    real long context, collapsing its batch size to N=36/device). The
-    closing mechanistic insight: GQA overshoots one way (3.58× memory-bound),
-    MLA overshoots the *other* way (3.17× compute-bound) — neither lands at
-    the efficient crossover, because a fixed architectural trade baked in
-    at training time can't adapt to deployment regime. Generalizes beyond
-    MLA: any fixed resource trade only pays off in the regime it was
+    optimization** (§2b.23): loses to plain GQA by ~9% at the matched 8,192
+    cap, wins by **2.25×** at DeepSeek-V2's real 163,840 cap. Generalizes:
+    any fixed architectural trade only pays off in the regime it was
     calibrated for.
-  - **Prefill's batch=32 was confirmed never capacity-derived (old, known
-    gap, §2.8) — checked properly, doesn't change any throughput number,
-    but explains why** (§2b.21): once compute-bound (which prefill always
-    is), throughput is provably invariant to batch size — work and time
-    scale together and cancel. Real, elegant side-finding: under
-    consistent worst-case-safe capacity math, prefill's own capacity-derived
-    batch size exactly equals decode's N, in every case checked — same
-    formula, no structural reason to differ.
-  - **Deployment model: expert-parallel sharding** (8-device EP group per
-    `moe-routing-notes.md`'s own real deployment), reversed from an initial
-    full-replication choice after the replication numbers turned out
-    structurally misleading (§2b.2–§2b.4). "One MoE decode machine" =
-    one 8-chip EP group, not one atomic chip (dense stays single-chip).
-    Unaffected by later corrections.
-  - **Decode-N**: 640/system (80/device) at DeepSeek-V2's real 163,840 cap
-    (§2b.7); 12,864/system (1,608/device) at the matched 8,192 cap (§2b.19)
-    — MLA's KV cache being 4.74× more compact per token than dense's means
-    far more requests fit per device at any given cap.
-  - **Open, flagged item**: MLA's original §2b.9 decode-attention bytes
-    calc is missing a fixed weight-loading term (for its own down/up-
-    projection matrices) that the GQA-hybrid comparison's equivalent calc
-    does include — noticed in §2b.22, not corrected. Likely small (the
-    KV-cache-read term dominates at real N) but a genuine inconsistency,
-    worth resolving if this thread gets revisited.
-  - **Prefill uses naive MLA (explicit K/V), decode uses absorbed** — a
-    real architectural fork resolved by mechanism (absorption only pays off
-    across *repeated* re-materialization; prefill pays that cost once,
-    §2b.12), not a "same formula, different N" substitution.
+  - **Deployment model: expert-parallel sharding**, 8-device EP group
+    (§2b.4) — "one MoE decode machine" = one 8-chip EP group, not one
+    atomic chip. Decode-N: 640/system (80/device) at the real 163,840 cap;
+    12,864/system (1,608/device) at the matched 8,192 cap.
+- **Phase 2c (KV handoff mechanism) — done, all numbers in `notes.md`
+  §2c.1–§2c.11**:
+  - Transfer cost: dense **40 MiB/request**; MoE (MLA) **8.4375 MiB/request**
+    (4.74× smaller — MLA's KV-cache formula, `(d_c+d_h^R)×n_layers`, pulled
+    fresh from the DeepSeek-V2 paper and independently confirmed against the
+    figure already carried from Phase 2b).
+  - Fabric: reused Boardfly (real, sourced TPU 8i interconnect) — the
+    project has never claimed Google runs disaggregation on TPU 8i
+    specifically, only that the fabric itself is real; that distinction is
+    what let this be a non-issue.
+  - KV handoff is **bandwidth-dominated** (17.48µs dense, 3.69µs MoE),
+    unlike MoE dispatch traffic on the same fabric which is
+    latency-dominated — a real regime difference from the payload being
+    ~16,000× bigger.
+  - Pool placement: locality-aware clustering (small repeated
+    prefill:decode units, e.g. 2 boards/8 chips ≈ 6:1) beats a pod-wide
+    half/half split, given a real unpublished hop-depth gap above the
+    4-chip/board tier — resolved via a hop-count sweep (1–3 hops ×
+    300–936.25ns), same move project #3 made for its own unpublished ICI
+    latency.
+  - DistServe sanity check: handoff cost is 0.29–0.34% (dense) and
+    0.040–0.071% (MoE) of a single decode step — comfortably clears
+    DistServe's own `<0.1%` claim (MoE outright; dense against a
+    deliberately stricter single-step denominator than DistServe's own
+    full-request one). Real mechanism: disaggregation helps via
+    **interference avoidance** (DistServe's 60ms→200ms colocation finding),
+    not because transfer is fast — cheap transfer just keeps separation
+    from giving that win back.
+- **Phase 3 (KV/weight placement policy) — done, all numbers in `notes.md`
+  §3.1–§3.11**:
+  - **Cap behavior: hard stop** (not compaction/sliding-window) — already
+    the assumption baked into N=320 since Phase 1, and matches this
+    project's chatbot-shaped workload (avg ~576 tokens, ~14× below the cap).
+  - **Admission: hard-cap (N=320-family), not dynamic** — sensitivity
+    computed anyway (N=4,558): throughput and chip ratio come back
+    essentially unchanged (830.5 vs. 830.59 req/s/chip), because N=320
+    already sits past the compute-bound crossover — a flat asymptote.
+  - **Intermediate pool: kept block-until-space-frees**, with its real cost
+    stated explicitly (re-couples prefill to decode's pace under sustained
+    backpressure, partially undoing Mooncake's own decoupling rationale) —
+    quantifying how often it binds needs Phase 4's real simulator.
+  - **KV-cache quantization (KIVI-style, 2-bit) and CPU-offload: declined**
+    — real, well-published, but quantization would ripple through every
+    number since Phase 1 and reintroduces the requantization-boundary
+    complexity already declined once via the Groq/FP4-FP8 reversal;
+    CPU-offload declined for the same scope-expansion reason as the pool
+    decision.
+  - **Hot-expert SRAM residency — the open thread `spec_v2`'s Phase 2b
+    section flagged, now closed**: under EP-sharding, each device's local
+    shard is just 22 experts (259.5 MB) — fits under TPU 8i's 384 MB SRAM,
+    but only *after* a naive attention-scratch estimate (56–112 MB,
+    genuinely uncertain) was resolved by pulling FlashAttention's real
+    tiling behavior directly (fused kernels reuse a small, fixed SRAM
+    buffer sequentially, never materializing the whole batch's scores —
+    the naive tight-fit concern was a modeling artifact, not real). **The
+    whole local shard fits — not a hot/cold ranking problem after all.**
+    Payoff: **zero at matched-cap** (already compute-bound), **~4.5×
+    throughput at real-cap** (601.55 → 2,735 req/s/chip, N=80/device, was
+    memory-bound 10.04×). Real-cap chip ratio recovers from **1.31:1 to
+    ~5.97:1** — residency closes almost the entire gap to the matched-cap
+    architecture comparison. The "2,735 ≈ 2,735.03" match between
+    real-cap+residency and matched-cap+streaming is not a coincidence —
+    both reach the identical compute-bound throughput ceiling via different
+    routes (removing a fixed cost vs. brute-force batching past the
+    crossover), the same asymptote mechanism the admission-policy
+    sensitivity check hit independently.
 
 ## How this project actually works — read before doing anything
 
@@ -127,104 +141,108 @@ output is correct:
   the interesting parts and hand over a finished answer. When the user is
   mid-derivation, ask the next sharpening question rather than completing
   the thought for them. **That said, the user sometimes explicitly wants to
-  co-derive arithmetic in real time ("I wanna be in the loop on this one")
-  — when they say that, walk through the math step by step with them rather
-  than batching it into one big computed answer; when they don't say that,
-  default delegation (compute it, show the result) is fine.** Calibrate to
-  what they ask for in the moment, not a fixed rule either way.
+  co-derive arithmetic in real time ("show me the derivation for my
+  learning") — when they say that, walk through the math step by step with
+  them rather than batching it into one big computed answer; when they
+  don't say that, default delegation (compute it, show the result) is
+  fine.** Calibrate to what they ask for in the moment, not a fixed rule
+  either way.
 - **Push back with a real, reasoned recommendation when asked "what do you
   think" — don't just list neutral options.** Reverse a position only when
-  there's a real technical reason, and say so plainly either way. This
-  session reversed the deployment-model recommendation (replication →
-  sharding) after finding two real reasons (full replication guts Phase 3's
-  hot-expert-residency question; the Groq-style "scope creep" fear that
-  drove the original replication pick didn't actually transfer, since
-  project #3 had already done the hard sharding-topology work) — a genuine
-  reversal, not deference to the user's preference.
+  there's a real technical reason, and say so plainly either way. Phase 3
+  did this twice: recommending hard-stop over compaction (workload-match
+  reasoning, not just "simpler"), and recommending researching real
+  fused-kernel behavior over immediately reaching for a hot/cold-expert
+  ranking workaround (the naive SRAM estimate turned out to be the wrong
+  model, not a real constraint).
 - **The single most load-bearing discipline this project needs: a reused
   number or formula needs re-verification for the *new* context, not just
-  confirmation that the *formula* is right.** This session caught three
-  separate real instances purely by asking "does this actually apply here":
-  T=8,192 (a real project's real number, still wrong for this project's
-  capacity purpose), the SDPA-only attention scope (completely correct for
-  the sibling attention project's own question, silently incomplete once
-  reused for throughput modeling), and DeepSeek-V2's real context length
-  (neither the borrowed 8,192 nor an assumed round number — checked via HF
-  config). None were formula errors — all were *scope/context* mismatches,
-  the harder kind to catch. Keep asking this question by default, even
-  about numbers that already came from a rigorous prior project.
-- **Ground everything in a real source** — a paper, an official spec page
-  (this session pulled DeepSeek-V2's real HF config rather than trust a
-  recalled number), a number already derived elsewhere in this repo. Flag
-  sourcing quality explicitly rather than presenting everything as equally
-  certain. Reused numbers (chip specs, `seq_len=8192`, etc.) should come
-  from this repo's own prior projects before reaching for a new source —
-  but "came from a prior project" is necessary, not sufficient; still check
-  it fits the new use case (see above).
-- **Catch errors by asking, not silently fixing** — and this goes both
-  ways: the user caught real errors this session by asking pointed
-  questions (the N/T mismatch, the SDPA-only gap), and self-caught errors
-  should be surfaced the same way, transparently, including when it means
-  walking back something said a few turns earlier (e.g. reconsidering the
-  causal-masking treatment once the actual precedent was checked). Don't
-  over-correct something the user already had right, either — one instance
-  this session got called out plainly ("that's what I said") after
-  dressing up an already-correct point in more formal language; own it
-  and move on rather than re-litigating.
+  confirmation that the *formula* is right.** Caught repeatedly across every
+  phase: T=8,192, the SDPA-only attention scope, DeepSeek-V2's real context
+  length (Phase 2b); and in Phase 3, the naive "weights fit in SRAM"
+  capacity check that didn't account for what else SRAM has to hold
+  *simultaneously* during compute — resolved only by checking real kernel
+  behavior (FlashAttention), not by assuming either direction.
+- **Ground everything in a real source.** This project pulled MLA's real
+  KV-cache formula from the DeepSeek-V2 paper directly (Phase 2c), and
+  FlashAttention's real tiling algorithm directly (Phase 3), in both cases
+  *after* a secondhand or naive estimate had already produced a plausible
+  but wrong-turning-out number. Reused numbers (chip specs, `seq_len=8192`,
+  etc.) should come from this repo's own prior projects before reaching for
+  a new source — but "came from a prior project" is necessary, not
+  sufficient; still check it fits the new use case.
+- **Catch errors by asking, not silently fixing** — this goes both ways:
+  the user catches real errors by asking pointed questions (the "why do we
+  even need those approaches if 22 experts obviously fit" pushback in Phase
+  3 led directly to finding the naive-estimate/real-kernel gap), and
+  self-caught errors get surfaced the same way, transparently, including
+  walking back something said a few turns earlier when a formula or
+  assumption doesn't hold up. Don't over-correct something the user already
+  had right, either.
 - **When the user explicitly delegates a low-stakes choice** ("just pick
   one, not something I want to spend time on"), make a reasoned pick, state
   the reasoning briefly, and log it — don't keep Socratic-questioning
-  something they've said they don't want to spend time on. (Used this
-  session for the Zipf-vs-two-tier distribution choice, the prefill batch
-  size, and the causal-discount question.)
+  something they've said they don't want to spend time on.
 - **Watch for scope creep against `spec.md`/`spec_v2.md`'s own stated
-  philosophy** (focused projects, depth over breadth). The Groq reversal in
-  Phase 0, and the deployment-model reasoning in Phase 2b, both hinge on
-  this same test: does pursuing X actually smuggle a different project's
-  job into this one, or does it just look that way at first glance?
+  philosophy** (focused projects, depth over breadth). Phase 3 hit this
+  twice: declining real CPU/SSD tiered offload (a whole new memory tier to
+  characterize) and declining KV-cache quantization below FP4 (would ripple
+  through every downstream number) — both real, both flagged as legitimate
+  future work, neither adopted, for stated reasons rather than by default.
 - **Keep `notes.md` current as you go, not as a final wrap-up step** — log
   decisions (and reversals, kept on record rather than scrubbed) as they
-  happen. This session logged ~18 subsections during live derivation
-  (§2b.1–§2b.18), plus a real-time correction to dense's own "done" Phase 2a
-  numbers (§2.9) once the QKVO gap was found mid-Phase-2b.
+  happen. The Phase 2c and Phase 3 conversations both batched the
+  `notes.md` write-up at the end instead (explicit user choice that
+  session, not the default), then split it into several small,
+  logically-scoped commits rather than one large one — matches this
+  project's "the more commits the merrier" preference when batching.
 
 ## Reading order for a new session
 
 1. `spec_v2.md` — the current assignment (supersedes `spec.md`, which stays
    as historical record — Phase 0/1/2a-dense are unchanged by v2).
 2. `notes.md` — full record of everything done so far; this is ground
-   truth. If short on time, `notes.md` §2.7 (Phase 2a Key Findings) and
-   §2b.18 (Phase 2b Key Findings) are the two highest-signal summaries.
+   truth. If short on time, the "Key Findings" subsections closing out each
+   phase (§2.7, §2b.18, §2c.11, §3.11) are the highest-signal summaries.
 3. Top-level `README.md`, `prefill_notes.md`, `decode_notes.md`,
    `moe-routing-notes.md` — as needed, when a specific number or finding
    from the prior two projects gets referenced. Don't re-read all of these
-   upfront; pull from them when `notes.md` points at them. Note: this
-   session found real gaps in trusting these sibling projects' numbers at
-   face value for *this* project's purposes (see "How this project works,"
-   above) — reread the specific section being reused, not just the
-   headline number.
+   upfront; pull from them when `notes.md` points at them. This project has
+   repeatedly found real gaps in trusting these sibling projects' numbers at
+   face value for its own purposes — reread the specific section being
+   reused, not just the headline number.
 
 ## Immediate next step
 
-**Phase 2c**: the KV-handoff mechanism (transfer cost, interconnect
-fabric) — spec_v2's Phase 2c, carried over unchanged from spec v1, **still
-not started**. Two things already flagged in `notes.md` §2b.17 to carry in,
-not rediscover:
+**Phase 4**: validate — implement Phase 0's discrete-event simulator with
+Phase 2/3's hypotheses plugged in, then compare predicted latency/throughput
+against DistServe's/Mooncake's published results (order-of-magnitude sanity
+check, not exact reproduction). Per `spec_v2.md`'s own flagged caveat, say
+explicitly going in: DistServe and Mooncake are both dense-transformer
+systems (OPT-175B) — there's no equivalent public production-scale MoE
+disaggregation benchmark to check Phase 2b's MoE ratio against the way 2a
+was checked against DistServe's own direction. Phase 4's MoE-side validation
+will have to lean more on internal consistency (does the whole derivation
+chain — chip ratio, transfer cost, SRAM residency — behave sensibly
+together?) than external cross-checking. Say this explicitly rather than
+implying 2b/2c/3 got the same grade of external validation the dense leg
+did.
 
-- **MoE's KV cache is 4.74× smaller per token than dense's** (17,280 vs.
-  81,920 bytes/token, MLA compression vs. GQA) — needs its own transfer-cost
-  number, not a reused dense one.
-- **MoE's handoff needs to target one specific device within the 8-chip EP
-  group** (attention is data-parallel, not replicated, so only one device
-  can own a given request's KV cache) — a decision surface dense's
-  single-chip handoff never had. The mechanism itself is standard
-  sticky-session load balancing (shared queue, pull on a free slot among
-  ~80 concurrent-request capacity/device) — not a hard problem, just new to
-  MoE. Don't over-invent a solution here; the answer is expected to be
-  unsurprising.
+Two real, load-bearing unknowns Phase 3 flagged that Phase 4's simulator is
+specifically positioned to resolve (not open design questions — genuine
+"needs the real thing, not a formula" items):
 
-Start by asking the user how they want to approach the interconnect-fabric
-question (same Boardfly fabric MoE project #3 already validated as
-latency-dominated, or a dedicated channel — spec's own open question) —
-don't just compute an answer, same pattern Phase 0/1/2a/2b all started
-with.
+- **How often does the intermediate KV pool actually hit capacity** under
+  this project's own modeled load (Poisson, moderate)? Determines whether
+  the block-until-space-frees placeholder's real cost (§3.4) is
+  load-bearing in practice or mostly theoretical.
+- **What's the real admission-queueing-time benefit of dynamic admission**
+  vs. the hard-cap policy kept in §3.3? The throughput/ratio numbers came
+  back identical either way — the actual difference (if any) would show up
+  in queueing latency, which only exists once real request arrivals and
+  batch formation are simulated.
+
+Start by confirming with the user how they want to scope the actual
+implementation (full discrete-event sim per Phase 0's design, or a reduced
+version) — don't just start building, same pattern every phase so far has
+opened with.
