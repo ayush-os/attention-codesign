@@ -2124,3 +2124,71 @@ concurrent-request capacity (~80/device at the real cap, ~1,608/device at
 the matched cap used here). Nothing new to derive in 2c; confirming it
 doesn't need revisiting was the actual task.
 
+### 2c.11 Key Findings — Phase 2c (complete)
+
+1. **The transfer-cost formula needed a real conceptual catch, not just a
+   missing term**: KV cache at handoff time only ever contains *input*-token
+   state — output tokens don't exist yet, since decode hasn't run a single
+   step before handoff fires. Missing this would have overcounted both
+   architectures' transfer cost by roughly `(input+output)/input ≈ 1.125×`
+   at this project's own request-shape numbers.
+2. **MLA's KV-cache formula, pulled fresh from the primary paper (Table 1,
+   arXiv 2405.04434), independently confirms the 17,280 bytes/token figure
+   already carried secondhand from §2b.17** — a genuine cross-check, not
+   just reuse, and revealed the formula's real shape: one compressed latent
+   per token, not a `2×(K+V)` structure the way MHA/GQA's cache is —
+   structurally, not just numerically, different from dense.
+3. **"Is the fabric real" and "has Google validated this exact workload on
+   it" are different questions, and only the first one needs a yes.** This
+   project has never claimed to replicate a documented Google system —
+   Phase 0 chose TPU 8i as a grounded hypothetical, sanity-checked only
+   directionally against DistServe/Mooncake (different hardware entirely).
+   Reusing Boardfly for handoff doesn't assert anything Phase 0 didn't
+   already assert.
+4. **KV handoff is bandwidth-dominated, not latency-dominated — a genuinely
+   different regime than MoE dispatch traffic on the same fabric**, purely
+   because the payload is ~16,000× bigger (real bulk transfer vs. tiny
+   per-hop dispatch messages). Dense clears this with huge margin; MoE's
+   smaller payload sits close enough to a multi-hop latency total that
+   physical placement of the paired chips is a real, non-ignorable lever.
+5. **Locality-aware clustering (small, repeated prefill:decode units placed
+   close together) beats a pod-wide half/half split**, directly because of
+   finding #4 — avoids the worst-case far-apart pair a naive split would
+   create. The natural cluster ratio (6:1) lines up with both architectures'
+   derived chip ratios almost exactly, but only using the matched-cap MoE
+   ratio (5.97:1) — the real-163,840-cap ratio (1.31:1) was deliberately
+   excluded, consistent with §2b.19 already flagging it as a context-length
+   artifact rather than an architecture effect.
+6. **Boardfly's sourced full-mesh guarantee is real only at the 4-chip/board
+   tier; every larger tier meshes at board granularity, not chip
+   granularity** — so any cluster large enough to hold a realistic ratio
+   unavoidably carries unpublished hop-depth uncertainty, resolved the same
+   way project #3 resolved its own unpublished ICI latency gap: sweep a
+   plausible range (1–3 hops × 300–936.25ns) instead of inventing one number.
+7. **Both architectures' handoff cost is comfortably small relative to a
+   single decode step** — MoE (0.040–0.071%) clears DistServe's own
+   `<0.1%-of-total-latency` claim outright; dense (0.29–0.34%) sits modestly
+   above it, but against a deliberately stricter denominator (one step, not
+   the full multi-step request DistServe actually measured against) — not
+   read as a real discrepancy.
+8. **Declining to build full end-to-end latency was a reasoned scope call,
+   not a shortcut**: the real number requires actual queueing/batch-formation
+   modeling (Phase 4's simulator, not a closed-form estimate), and the
+   missing rigor can only shrink the reported fractions further — a
+   one-sided risk that can't overturn "negligible," only confirm it more
+   strongly. Worth doing properly once the simulator exists, not worth
+   hand-approximating now.
+9. **Transfer cost being cheap isn't why disaggregation helps — that's
+   interference avoidance** (DistServe's own Phase 0 finding: one prefill
+   request colocated in a decode batch inflates batch time 60ms→200ms).
+   Cheap KV transfer is what keeps physical separation from giving that win
+   back, not the reason to separate in the first place. Two distinct claims,
+   easy to conflate, worth keeping separate in the final synthesis (Phase 5).
+10. **MoE's device-targeting question was already closed during Phase 2b's
+    own wrap-up (§2b.17)** — sticky-session load balancing, an unsurprising
+    answer to a question that was new to MoE (dense's single-chip handoff
+    never had a destination to pick) even though the mechanism itself
+    wasn't hard. Phase 2c's job here was confirming closure, not fresh
+    derivation.
+
+---
