@@ -1,20 +1,20 @@
 # Workload → Silicon: Hardware & System Codesign for LLM Inference
 
-Two self-directed codesign studies — single-chip attention microarchitecture, then multi-chip MoE routing — every prediction hand-derived and logged *before* being checked against a tool or the literature.
+Three self-directed codesign studies — single-chip attention microarchitecture, multi-chip MoE routing, then disaggregated serving + memory-hierarchy placement — every prediction hand-derived and logged *before* being checked against a tool, real hardware, or the literature.
 
-**Stack:** Timeloop/Accelergy, Gemmini (Chipyard), Verilator, ASTRA-sim · **Workloads:** Llama 3-70B attention (GQA), prefill and decode · DeepSeek-V2 MoE routing (multi-chip, 8-way EP)
+**Stack:** Timeloop/Accelergy, Gemmini (Chipyard), Verilator, ASTRA-sim, hand-built SimPy discrete-event simulator · **Workloads:** Llama 3-70B attention (GQA), prefill and decode · DeepSeek-V2 MoE routing (multi-chip, 8-way EP) · disaggregated prefill/decode serving for both models
 
 - **The compute/memory-bound regime is a design decision, not a workload property**: the same prefill attention workload hits **AI = 8,192 FLOPs/byte** (compute-bound, fused) or **AI ≈ 126** (memory-bound, unfused) against a TPU v5e ridge point of **≈480.5** — the fusion decision alone swings the regime **65×**.
-- **Independently found a GQA-breaking bug by hand**, before touching Timeloop or Gemmini: a naive accumulator-driven `tile_q=32` forces Q-tile-outer loop ordering in prefill, causing **~256× K/V re-fetching from HBM** — breaking GQA's textbook "fetch once" reuse claim.
-- **Hand-found a second hardware-breaking issue, this time in decode**: a systolic array's fill/drain amortization needs a deep temporal stream — prefill gets 65,536 cycles per K/V load, decode collapses to just 8, landing a naive utilization estimate right at the edge of decode's own ~30× roofline margin. Forced a pivot to a SIMD compute primitive, then confirmed by reading Gemmini's actual source that **no such compute path exists in the generator at all** — a harder tool-representability gap than prefill's own fusion-modeling limit.
-- **The same "just quantize it" lever is decisive for the MoE project below and structurally powerless for decode attention** — decode's regime-flipping crossover would need **~0.27 bits/element**, not a realizable format, vs. MoE's real crossover at **≈2.5 bytes/element** (FP8/BF16). Same mechanism, opposite verdict: purely a function of how large a margin each workload's numerics lever has to close (~5–7× for MoE, 30–240× for decode), not any difference in how the lever works.
+- **Built a discrete-event simulator from scratch and found the real system bottleneck no closed-form derivation had surfaced**: prefill's fixed compute ceiling (**~4,138 req/s** across a 29-machine pool), not decode capacity or the KV-cache pool — decode occupancy self-limits and plateaus under 2.2× more load while prefill wait time grows unboundedly. Caught **3 real implementation bugs** in the process, including a race condition that could have silently over-admitted requests past the decode cap.
+- **The dense-vs-MoE disaggregation ratio depends almost entirely on context length, not architecture**: held at the same context, dense (**5.82:1** prefill:decode chips) and MoE (**5.97:1**) land within 2.6% — two real, opposing architectural effects (sparse FFN, MLA attention) that happen to cancel. Stretch to DeepSeek-V2's real 163,840-token deployment cap and the same two effects stop canceling: the ratio collapses to **1.31:1**, recovered back to 5.97:1 only after proving 22 experts fit permanently SRAM-resident (a **4.5× throughput** jump).
+- **The same "just quantize it" lever is decisive for the MoE routing project below and structurally powerless for decode attention** — decode's regime-flipping crossover would need **~0.27 bits/element**, not a realizable format, vs. MoE's real crossover at **≈2.5 bytes/element** (FP8/BF16). Same mechanism, opposite verdict: purely a function of how large a margin each workload's numerics lever has to close (~5–7× for MoE, 30–240× for decode), not any difference in how the lever works.
 - **Derived DeepSeek-V2's real dispatch/combine traffic** against the paper's actual device-limited routing mechanism (not the textbook formula) and proved the workload sits on a **hard, imbalance-proof compute-bound floor** (~21,065 FLOPs/byte, ~5× the TPU 8i ICI ridge point) — no routing skew, however severe, can flip it comms-bound. Only a numerics choice (dispatch precision) can.
 
 ---
 
-## Methodology (shared across both projects)
+## Methodology (shared across all three projects)
 
-Every phase follows the same loop: **hand-derive a prediction → validate against a tool or real literature → explain every gap mechanistically.** Applied first at the single-accelerator level (PE array, dataflow, scratchpad), then one level up at the system level (interconnect topology, bandwidth, buffering). Scope is treated as a first-class, discussable decision throughout, not just something to push through — several phases were deliberately narrowed or skipped once their marginal learning value was checked against real cost, with the reasoning stated rather than left implicit (see both writeups' scope sections).
+Every phase follows the same loop: **hand-derive a prediction → validate against a tool, real hardware, or a hand-built simulator → explain every gap mechanistically.** Applied first at the single-accelerator level (PE array, dataflow, scratchpad), then one level up at the system level (interconnect topology, bandwidth, buffering), then one level further at the memory-hierarchy/serving level (SRAM vs. HBM residency, prefill↔decode handoff) — where no off-the-shelf tool fit, so the third project hand-builds its own discrete-event simulator rather than forcing an ill-fitting tool. Scope is treated as a first-class, discussable decision throughout, not just something to push through — several phases across all three projects were deliberately narrowed, skipped, or reversed once their marginal learning value or real feasibility was checked, with the reasoning kept on record rather than scrubbed (see each writeup's scope/reversal sections).
 
 ---
 
@@ -87,6 +87,44 @@ Extends the same loop one level up the stack: from single-accelerator microarchi
 
 Full writeup (workload, hypothesis, ASTRA-sim results, cross-project
 synthesis, key takeaways): [`moe-routing-notes.md`](moe-routing-notes.md).
+
+---
+
+## Disaggregated Serving + Placement Codesign → [`disagg_and_placement_notes.md`](disagg_and_placement_notes.md)
+
+**Stack:** hand-built discrete-event simulator (SimPy from scratch — no off-the-shelf tool fits this question) · **Workloads:** Llama 3-70B (dense, GQA) and DeepSeek-V2 (MoE, MLA + 8-way EP), both disaggregated into prefill/decode pools on homogeneous TPU 8i/FP4
+
+Extends the stack one level further: from single-accelerator microarchitecture, to multi-chip interconnect, to the memory-hierarchy/serving layer underneath both — what actually lives in SRAM vs. HBM vs. gets transferred as a request moves from prefill to decode, and how many chips of each phase a rack actually needs.
+
+- Derived the **prefill:decode chip ratio** for both architectures from first principles (service time → throughput → chip count, not the compute/memory-bound *label* alone): **~5.82:1** dense, **~1.31:1** MoE at DeepSeek-V2's real 163,840-token deployment cap — then found, by isolating each architectural lever independently, that the ratio gap is almost entirely a **context-length artifact**, not an architecture effect: held at the same context, MoE lands at **~5.97:1**, within 2.6% of dense, via two real, opposing effects (sparse FFN, MLA attention) that nearly cancel.
+- **Caught a first-order omission by re-checking a reused number against its new use case**: both sibling attention writeups above are deliberately SDPA-only — correct for a microarchitecture question, silently incomplete once reused here for throughput. Adding the missing QKVO projection cost (**21.4% of FFN's magnitude**, in both FLOPs and bytes) moved the dense ratio a real but Amdahl's-Law-bounded **+5.8%** (5.50→5.82), not a rounding error and not a blowup — a fixed local correction, scaled by how much of each phase's total it actually touches.
+- **Tried, then deliberately reversed, two real architectural choices once their consequences became visible** — a heterogeneous TPU 8i/Groq chip split (Groq's SRAM can't hold Llama-3-70B's weights without breaking the simulator's own machine abstraction) and full-weight MoE replication (looked cheap, but silently eliminated the hot-expert-residency question this project exists to answer) — both kept on record rather than scrubbed once reversed.
+- **Resolved a genuinely tight SRAM-capacity question by pulling real kernel behavior instead of guessing**: a naive estimate of MoE's local 22-expert shard (259.5MB) plus attention's transient compute state left only ~12.5MB of headroom in TPU 8i's 384MB SRAM — resolved by confirming FlashAttention's real tiling behavior bounds that state by a small, fixed tile size, not batch size. Residency then buys a **4.5× throughput jump** at real deployment capacity and recovers the chip ratio from 1.31:1 back to ~5.97:1.
+- **Built a from-scratch discrete-event simulator and found the actual system bottleneck**: the intermediate KV-cache pool, sized at a deliberately conservative worst-case anchor, showed **zero contention across 2M+ simulated requests** — the real bottleneck is prefill's fixed compute-bound throughput ceiling (**~4,138 req/s**), not decode capacity or the pool. Confirmed via direct occupancy instrumentation: decode occupancy plateaus under 2.2× more load while prefill wait time grows unboundedly. Caught 3 real implementation bugs (a wrong service-time formula, an admission-cap race condition, a missing pool-release call) before trusting any result.
+
+**Chip ratio — dense vs. MoE, architecture isolated from context length:**
+
+| | Attention | FFN | Context cap | Ratio |
+|---|---|---|---|---|
+| Dense | GQA | Dense (full) | 8,192 | 5.82 |
+| Hybrid (isolates FFN sparsity) | GQA | MoE (sparse) | 8,192 | 4.60 |
+| MoE, matched (isolates MLA vs. GQA) | MLA | MoE (sparse) | 8,192 | **5.97** |
+| MoE, real deployment | MLA | MoE (sparse) | 163,840 | **1.31** |
+
+| Phase | Focus | Status |
+|---|---|---|
+| 0 | Setup: reference reading (PagedAttention/DistServe/Mooncake), simulator design, chip choice | ✅ done — TPU 8i homogeneous, FP4; heterogeneous Groq-decode tried and reversed |
+| 1 | Memory hierarchy characterization: KV-cache growth curve, weights-vs-KV-cache tension | ✅ done |
+| 2 | Dense chip ratio (service time → throughput → chip count) | ✅ done — ~5.82:1, post-QKVO-correction |
+| 2b | MoE chip ratio (DeepSeek-V2, expert-parallel sharding) | ✅ done — ~1.31:1 real cap / ~5.97:1 matched cap |
+| 2c | KV handoff mechanism: transfer cost, interconnect fabric | ✅ done — bandwidth-dominated, both architectures clear DistServe's <0.1%-of-latency bar |
+| 3 | KV/weight placement policy: admission, eviction, hot-expert SRAM residency | ✅ done |
+| 4 | Validate: discrete-event simulator (dense leg) | ✅ done — real bottleneck is prefill's compute ceiling, not decode or the pool |
+| 5 | Full synthesis: rack-scale SRAM/bandwidth budget across all four projects' evidence | ✅ done |
+
+Full writeup (all phases, cross-phase synthesis, open threads):
+[`disagg_and_placement_notes.md`](disagg_and_placement_notes.md). Simulator
+code and sweep results: [`disagg-and-placement-sim/`](disagg-and-placement-sim/).
 
 ---
 
