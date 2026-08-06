@@ -2016,3 +2016,53 @@ worth of latency at the high end of the range — so unlike the MoE-dispatch
 case, hop count (i.e., physical placement of the paired chips) actually
 matters here for MoE specifically.
 
+### 2c.6 Pool placement — locality-aware clustering instead of a pod-wide half/half split
+
+**The problem with a naive split**: partitioning the whole pod into one
+prefill half and one decode half means the *worst-case* pair (furthest
+prefill chip, furthest decode chip) could sit many mesh-tiers apart —
+directly bad given §2c.5's finding that MoE's hop count isn't free to ignore.
+
+**Proposed instead**: a small, repeated prefill:decode cluster placed close
+together in the mesh, rather than two giant far-apart blocks — e.g. 2 boards
+(8 chips) = 6 prefill + 1–2 decode, tiled across the pod. **Ratio check**:
+6:1 lines up closely with both dense's derived ratio (5.82:1, §2.9) and
+MoE's matched-cap ratio (5.97:1, §2b.19) — **deliberately not** the
+real-163,840-cap MoE ratio (1.31:1), since §2b.19 already established that
+number as a context-length artifact rather than the architecture-level
+comparison this project is using as primary.
+
+**Checked whether shrinking the cluster to exactly 1 board (4 chips, the
+only tier with a *sourced* chip-level full-mesh guarantee) would sidestep
+the hop-count uncertainty entirely — it doesn't.** A 6:1 shape needs ≥7
+chips with an integer decode-chip count; 4 chips can't hold it regardless.
+Worse, no Boardfly tier *above* the 4-chip board is actually confirmed
+chip-level full mesh — `moe-routing-notes.md`'s own description ("each tier
+stays small enough that O(N²) wiring is feasible... reaching pod scale via
+nesting") implies meshing at *board* granularity above that tier, not full
+chip-to-chip wiring globally. So any cluster large enough to hold a
+realistic ratio — 2 boards or otherwise — unavoidably carries this same
+unpublished hop-depth question. Shrinking the cluster doesn't remove the
+uncertainty, just removes the ability to hit the right ratio.
+
+### 2c.7 Hop-count sensitivity sweep
+
+Same move project #3 made for its own unpublished ICI latency figure
+(§4.2 of `moe-routing-notes.md`): sweep a plausible range rather than invent
+one number. Swept 1–3 hops (board→board relay depth, unconfirmed) × the same
+300/500/750/936.25 ns/hop range already established:
+
+| Hops | +300ns/hop | +500ns/hop | +750ns/hop | +936.25ns/hop |
+|---|---|---|---|---|
+| 1 | 3.99µs | 4.19µs | 4.44µs | 4.62µs |
+| 2 | 4.29µs | 4.69µs | 5.19µs | 5.56µs |
+| 3 | 4.59µs | 5.19µs | 5.94µs | **6.50µs** |
+
+(baseline: MoE's pure-bandwidth term, 3.686µs)
+
+**Dense stays safely bandwidth-dominated across the entire range** — even
+the worst case (3 hops × 936.25ns ≈ 2.81µs added) only brings dense to
+~20.3µs, a small move off its 17.48µs floor. **MoE's worst case roughly
+doubles the pure-bandwidth number** (3.69µs → 6.50µs) — real, but still
+low-single-digit microseconds in absolute terms.
+
