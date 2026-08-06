@@ -1976,3 +1976,43 @@ the same reason.
 as expected (same `avg_input` scales both linearly, so it cancels out of the
 ratio).
 
+### 2c.4 Interconnect fabric — Boardfly, reused, with the claim distinguished from what it isn't
+
+**Real concern raised, resolved by separating two different claims**, not by
+picking one and moving on: (1) *does Boardfly physically exist and connect
+these chips* — yes, directly sourced (Google Cloud's TPU 8i deep-dive,
+already grounded in `moe-routing-notes.md` §1); (2) *has Google published
+that they run prefill/decode disaggregation on TPU 8i specifically* — no,
+and this project has never claimed that. Since Phase 0, "TPU 8i, homogeneous,
+both pools" has always been this project's own design choice, sanity-checked
+only *directionally* against DistServe/Mooncake (which ran on A100/OPT-175B,
+an entirely different chip). Reusing Boardfly for handoff asserts nothing
+beyond what Phase 0 already asserted by picking the chip in the first place.
+
+**Decided: reuse Boardfly.** Grounded on the same basis as the rest of the
+project; no evidence found that would motivate inventing a dedicated channel
+instead.
+
+### 2c.5 Bandwidth-vs-latency regime check — a real difference from MoE dispatch's own conclusion
+
+Project #3 found MoE dispatch/combine traffic **latency-dominated** on
+Boardfly (2,560-byte payloads, ~1ns transfer time, dwarfed by hundreds-of-ns
+fixed hop latency, `moe-routing-notes.md` §3.1). KV handoff's payload is
+~16,000× bigger (40 MiB vs. 2,560 bytes) — worth checking whether that
+conclusion still holds rather than assuming it carries over.
+
+`bytes / 2.4 TB/s` (Boardfly ICI bandwidth, `moe-routing-notes.md` §1):
+
+- Dense: `41,943,040 / 2.4×10¹² ≈ 17.48 µs`
+- MoE: `8,847,360 / 2.4×10¹² ≈ 3.69 µs`
+
+vs. the hop-latency range project #3 swept (no published absolute TPU 8i ICI
+latency figure exists — Google states only relative diameter reductions):
+300, 500, 750, 936.25 ns/hop.
+
+**Dense is comfortably bandwidth-dominated** — 17.48µs dwarfs even several
+hops' worth of latency. **MoE is genuinely closer** — 3.69µs is only ~4 hops'
+worth of latency at the high end of the range — so unlike the MoE-dispatch
+case, hop count (i.e., physical placement of the paired chips) actually
+matters here for MoE specifically.
+
