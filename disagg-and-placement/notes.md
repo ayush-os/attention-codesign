@@ -1652,4 +1652,117 @@ checked rather than assumed, and found two real things:
     problem needing invention. Matches this project's own established
     precedent that a boring, expected answer is still a real finding.
 
----
+### 2b.19 Sensitivity check — the ~1.31:1 result is mostly a context-length artifact, not an architecture effect
+
+**Question raised**: §2b.16's ~1.31:1 used DeepSeek-V2's real
+`max_position_embeddings=163,840` as the decode-N capacity cap (§2b.7,
+correctly grounded vs. the borrowed 8,192). But Llama-3-70B's own cap is
+8,192 — a real, un-controlled-for confound between the two models. How much
+of the ratio's divergence from dense is genuinely about MoE *architecture*
+(sparsity, MLA) vs. just DeepSeek-V2 happening to ship a much longer real
+context window?
+
+**Recomputed MoE decode at cap=8,192** (matching dense, everything else
+about DeepSeek-V2 kept real — weight footprint, KV bytes/token, reserve
+convention):
+
+- `N/device = 13,180,411 / 8,192 = 1,608` (T=12,864 system-wide) — far
+  above dense's 320/chip, because MLA's KV cache is 4.74× more compact per
+  token (§2b.17) — at the *same* context length, far more requests fit.
+- Distinct-experts coverage: 100.00% (fully saturated, unsurprising at
+  N=1,608 — far past the §2b.2 saturation point). FFN bytes/device =
+  259.52MB (same ceiling as before, N-independent once saturated).
+- **FFN**: compute_t=60.10µs, mem_t=30.18µs → **compute-bound, 1.99×**
+  (flips from memory-bound at the real cap).
+- **Attention**: compute_t=93.01µs, mem_t=29.29µs → **compute-bound,
+  3.17×** (same regime as before — attention's own FLOPs scale with N too,
+  so it stays compute-bound and gets proportionally larger, not a regime
+  flip).
+- Combined/layer=153.11µs; ×60 layers=9.186ms; **decode throughput =
+  2,735.03 req/s/chip** (vs. 601.55 at the real cap, vs. dense's 830.59).
+
+**New ratio: `2735.03/457.98 ≈ 5.97`** — **essentially identical to
+dense's 5.82:1**, not the 1.31:1 from §2b.16.
+
+| | Dense | MoE (real, 163,840 cap) | MoE (matched, 8,192 cap) |
+|---|---|---|---|
+| Ratio | 5.82 | 1.31 | **5.97** |
+
+**Reading, stated plainly rather than left implicit**: once context length
+is held constant, **MoE's architecture (sparsity + MLA) barely moves the
+prefill:decode *balance*** — the §2b.16 ~1.31:1 result was almost entirely
+a context-length artifact (DeepSeek-V2's real 163,840 vs. Llama's real
+8,192), not a genuine architecture effect. What sparsity + MLA *do* change
+dramatically is **absolute throughput on both ends** — MoE processes far
+more requests/sec per chip than dense at every phase (2,735 vs. 830
+decode; 458 vs. 143 prefill) — roughly proportionally on both sides, which
+is exactly why the *ratio* barely moves even though every underlying
+number does.
+
+**Framing decision, made explicitly**: given this project's actual
+interest is the dense-vs-MoE *architecture* comparison (not a faithful
+DeepSeek-V2-specific deployment replica), **the matched (8,192-cap) result
+is now the primary finding**: MoE architecture alone doesn't rebalance
+prefill:decode, it scales both phases up together. The real-163,840 result
+(§2b.16, ~1.31:1) stays on record as a secondary, real finding — DeepSeek-V2's
+own actual long-context deployment profile is a legitimate, separate lever
+worth knowing about, just not the "architecture" answer to spec_v2's
+question. **Both numbers are correct; they answer different questions**
+("what does MoE architecture alone do" vs. "what does serving this real,
+specific, long-context model actually look like") — spec_v2's own framing
+("does disaggregation work the same way once you're serving MoE") is best
+answered by the matched comparison, so that's the headline from here
+forward. §2b.16/§2b.18's original ~1.31:1 framing stays unedited above,
+per this project's own convention of keeping superseded findings on
+record rather than scrubbing them — this section is the correction, not a
+replacement.
+
+### 2b.20 Isolating variables — a hybrid model to separate FFN sparsity from MLA-vs-GQA
+
+**Question raised**: §2b.19's matched-cap comparison (MLA + sparse FFN vs.
+dense's GQA + dense FFN) still bundles two architecture changes together.
+How much of the ratio movement is FFN sparsity alone vs. attention
+mechanism alone?
+
+**Construction, stated as a real choice, not a real model**: DeepSeek-V2
+doesn't have a native GQA config (its own MLA head params, `n_h=128,
+d_h=128`, don't satisfy `n_heads×d_head=d_model` the way vanilla attention
+needs — they route through a compressed bottleneck first, so they can't be
+transplanted directly). Built the least-arbitrary hybrid: keep DeepSeek-V2
+intact everywhere (`d_model=5,120`, 60 layers, sparse FFN) except attention
+— use `d_head=128` (the one number every version of this repo agrees on),
+giving `n_heads=5,120/128=40`, and reuse Llama's own real GQA group-size
+ratio (8) → `n_kv_heads=5`. Motivated, not invented from nothing, but a
+real construction choice, flagged as such.
+
+**Full pipeline derived fresh** (same methodology throughout — sum-of-stage-maxes,
+worst-case-safe capacity, cap=8,192 matching dense): GQA KV cache format =
+38,400 bytes/token (2.22× MLA's 17,280). Decode N/device=731 (vs. MLA's
+1,608 at the same cap — MLA's smaller cache fits more). Decode: attention
+memory-bound 3.58×, FFN memory-bound 1.10× (barely). Prefill: attention
+compute-bound 7.60×, FFN compute-bound 2.54×. **Hybrid decode throughput =
+2,991.63 req/s/chip; prefill = 649.83 req/s/chip; ratio = 4.60.**
+
+**Decomposed result, three points on one line**:
+
+| | Attention | FFN | Cap | Ratio |
+|---|---|---|---|---|
+| Dense | GQA | Dense (full) | 8,192 | 5.82 |
+| Hybrid | GQA | MoE (sparse) | 8,192 | **4.60** |
+| MoE, matched | MLA | MoE (sparse) | 8,192 | **5.97** |
+| MoE, real | MLA | MoE (sparse) | 163,840 | 1.31 |
+
+**FFN sparsity alone** (dense→hybrid) drops the ratio 5.82→4.60 (~21%
+lower) — prefill's throughput grows more (4.55×) than decode's (3.60×),
+because prefill is always compute-bound and cashes in the full compute
+savings, while decode's dense FFN was already right at its own
+compute/memory crossover (1.08× CB) — cutting compute further pushes it
+*across* that crossover into memory-bound (hybrid: 1.10× MB), capping the
+gain it can extract.
+
+**MLA vs. GQA alone** (hybrid→MoE-matched, FFN and cap both held fixed)
+moves the ratio the *other* way, 4.60→5.97 — nearly canceling the FFN
+effect. This is why §2b.19's bundled matched-cap result (5.97) landed so
+close to dense (5.82): not because neither architecture change mattered,
+but because they move the ratio in opposite directions and mostly offset.
+
