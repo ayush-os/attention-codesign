@@ -1907,3 +1907,72 @@ resources only pays off in the regime it was calibrated for; measuring it
 outside that regime can show it overshooting, not just underperforming.**
 
 ---
+
+## Phase 2c — KV Handoff Mechanism
+
+Scope per `spec_v2.md`: transfer cost (bytes) and interconnect fabric choice,
+for both dense and MoE. Narrower than 2a/2b by design — most of what this
+phase needed was already banked (KV-bytes/token formulas, chip/fabric specs,
+DistServe's own checkpoint numbers from Phase 0), so this phase composed
+existing pieces rather than deriving new architecture-level findings.
+
+### 2c.1 Transfer-cost formula — input tokens only, a real scope catch
+
+**First draft of the dense formula was wrong on two counts**, both caught
+before computing anything: missing the precision-bytes term (FP4, ×0.5), and
+using `input+output` tokens instead of `input` alone. The second is the real
+one — checked by asking *what's actually in the KV cache at the moment
+handoff fires*. Handoff happens the instant prefill finishes; decode hasn't
+run a single step yet, so no output-token KV cache exists to transfer.
+Output tokens' KV cache is generated incrementally, in place, on the decode
+chip itself, after handoff — it never gets shipped. **Correct formula**:
+
+`bytes = avg_input_tokens × 2(K+V) × precision_bytes × d_head × n_kv_heads × n_layers`
+
+Same shape as Phase 1 §1.2's per-token formula, just evaluated at the
+average prompt length instead of accumulated over the full request.
+
+### 2c.2 Dense transfer cost
+
+Using this project's own DistServe-anchored average prompt length
+(`avg_input=512`, §2.3) and Phase 1's per-token constants (`d_head=128`,
+`n_kv_heads=8`, `n_layers=80`, FP4):
+
+`bytes = 512 × 81,920 bytes/token = 41,943,040 bytes = 40 MiB` (exact, since
+`81,920 = 80×1,024`).
+
+### 2c.3 MoE (MLA) transfer cost — formula sourced fresh from the primary paper
+
+**Checked rather than reused secondhand**: `notes.md` §2b.17 already carried
+a 17,280 bytes/token figure for MLA (sourced via `moe-routing-notes.md`), but
+the user recalled the DeepSeek-V2 paper states the KV-cache formula directly
+— worth pulling the primary source rather than trusting the secondhand
+number again, same discipline as everywhere else in this project. Confirmed
+via the paper's Table 1 (arXiv 2405.04434, HTML rendering):
+
+`KV cache elements/token = (d_c + d_h^R) × n_layers`
+
+where `d_c=512` (KV compression dim) and `d_h^R=64` (decoupled RoPE key dim,
+shared across all heads — not per-head the way MHA/GQA's K/V are). Notably
+**not** a `2×(K+V)` shape — MLA caches one compressed latent per token, not
+separate K and V tensors, which is the structural reason its footprint is so
+much smaller.
+
+`(512+64) × 60 = 34,560 elements/token × 0.5 B (FP4) = 17,280 bytes/token` —
+**matches §2b.17's figure exactly**, now independently confirmed from the
+primary source instead of carried secondhand.
+
+**Per-request transfer**: `512 × 17,280 = 8,847,360 bytes = 8.4375 MiB`.
+
+**`avg_input=512` used for MoE too, deliberately, not by default** — same
+matched-cap logic §2b.19 already established for the chip-ratio comparison.
+DeepSeek-V2's real deployment skews toward much longer context (the
+163,840-token cap that drove §2b.16's separate real-cap ratio), but using
+that here would make the dense/MoE transfer-cost comparison incomparable —
+same tradeoff already accepted once for the ratio, accepted again here for
+the same reason.
+
+**Ratio: `40 MiB / 8.4375 MiB ≈ 4.74×`** — identical to the per-token ratio,
+as expected (same `avg_input` scales both linearly, so it cancels out of the
+ratio).
+
