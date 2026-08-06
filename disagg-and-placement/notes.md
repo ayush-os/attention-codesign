@@ -2563,3 +2563,349 @@ memory bottleneck is removed." This is the direct, quantified answer
    surfacing twice in one phase, from two unrelated starting questions.
 
 ---
+
+## Phase 4 — Validate (discrete-event simulator)
+
+Dense (Llama-3-70B, TPU 8i, FP4) leg only this pass — hard-cap admission
+(N=320/machine) as the primary policy, matching what §3.3 actually chose.
+MoE and a from-scratch dynamic-admission-with-eviction model are legitimate
+follow-on passes, not built here (same scope discipline as every prior
+phase's declined extensions). Code lives in
+[`sim/`](sim/) (`disagg_sim/` package + `validate.py`, `run_sweep.py`,
+`explore_*.py`, `tests/`) — a from-scratch SimPy build, no existing Python
+convention anywhere in this repo to match.
+
+### 4.1 Simulator design
+
+**Why discrete-event at all**: Phases 1–3's closed-form math answers
+steady-state throughput/ratio questions but is structurally blind to
+time-dependent contention — how often the intermediate pool actually hits
+capacity, and what real admission-queueing latency looks like. Both are
+questions only a simulator can answer; that's this phase's entire job, not
+re-deriving throughput.
+
+**Entities**: 29 prefill machines, 5 decode machines (matches the §2.9
+5.82:1 ratio), one shared `simpy.Container`-backed intermediate KV pool.
+
+**Prefill batching**: a machine, when free, grabs everything currently
+queued up to `PREFILL_BATCH_CAP=32` and processes it as one batch, service
+time recomputed for the *actual* batch size taken (not fixed at 32) — no
+reason to wait for a full batch given prefill's compute-bound regime.
+**`32` is flagged explicitly in `constants.py` as inherited from the
+attention project, never independently re-derived as a real TPU-8i capacity
+limit for this project** (per §2.8's own note) — a stated assumption, not
+load-bearing hardware truth.
+
+**Decode admission + ticking**: greedy, join-shortest-queue admission across
+the 5 machines up to `DECODE_N_CAP=320` (this one *is* a real derived
+HBM-capacity number, Phase 1 §1.5). Each admitted request runs as its own
+independent SimPy process generating tokens one at a time — deliberately
+**not** synchronized/lockstep batching across all resident requests. Each
+token step reads the machine's *live* occupancy `n` (not the 320 cap) and
+recomputes `decode_token_time(n)` fresh — a state-dependent-service-rate /
+processor-sharing-style queue, matching Phase 0's explicit preference to
+avoid full iteration-level scheduling complexity.
+
+**Why prefill and decode needed genuinely different batching mechanisms,
+not a shared abstraction**: this falls directly out of the compute-bound
+vs. memory-bound distinction §2 already established. Prefill has no
+batch-invariant fixed cost, so smaller batches just take proportionally
+less time — no throughput reason to wait for a full batch. Decode's
+FFN/QKVO terms *do* have a batch-invariant weight-load floor below the
+~296-token crossover (§2.5) — below crossover, growing occupancy is nearly
+free; above it, every additional concurrent request adds real linear cost.
+Modeling decode as a shared per-step batch (the way prefill batches) would
+have been wrong; per-request independent ticking against live occupancy is
+what actually reproduces that flat-then-linear shape.
+
+**Service-time formulas** (`service_time.py`) — corrected mid-design, worth
+recording precisely since it changes real numbers: my own verbal design
+brief (mid-conversation, before any code existed) described prefill
+attention as "memory-bound throughout" with a K+V-only byte formula. A
+planning sub-agent checking this against §2.3/§2.5 directly caught that
+prefill attention is actually **marginally compute-bound (~1.55× margin)**
+at the real seq_len=512 operating point, and that the byte formula needs
+the Q/O terms too (K+V-only silently undercounts). Both corrected formulas
+were independently hand-verified bit-exact against this file's own §2.3/
+§2.5/§2.9 numbers before being trusted — the general roofline
+`time = max(FLOPs/peak_compute, bytes/HBM_bandwidth)` applies to *all three*
+terms (attention, QKVO, FFN), both phases, not just QKVO/FFN as originally
+(incorrectly) described. QKVO and FFN share an identical crossover point
+(~T=296) since their FLOPs/bytes are both exactly 21.4% of the other's
+magnitude — the scaling factor cancels out of where compute time crosses
+the memory floor.
+
+**Three real implementation bugs caught before any sweep result was
+trusted** (kept on record, not scrubbed, per this project's own convention):
+
+1. **The attention-formula error above** — caught by a sub-agent during
+   planning, independently re-verified by hand, not silently accepted.
+2. **A race condition in naive `simpy.Resource`-based admission-cap
+   enforcement.** `Resource.count` only updates once a spawned process
+   actually reaches its `yield`, not at the synchronous moment the
+   dispatcher *decides* to admit a request — two requests dispatched to the
+   same machine within one dispatch pass could both see stale occupancy and
+   over-admit past the 320 cap. Fixed by using a plain integer counter,
+   incremented synchronously at the moment of the admission decision, since
+   the dispatcher already does its own centralized admission control (a
+   generic multi-consumer `Resource` was redundant, and actively wrong).
+3. **A missing pool-release call.** `PrefillDispatcher._handoff()` acquires
+   pool bytes on prefill completion; nothing released them anywhere until
+   this was caught — the pool would have monotonically filled and never
+   drained, silently breaking the entire contention experiment. Fixed by
+   releasing bytes at the real physical event that frees them: the moment a
+   request is admitted to a decode machine (`DecodeDispatcher._try_dispatch`).
+
+### 4.2 Validation against Phase 2's closed-form numbers
+
+`validate.py` runs two checks, each combining a direct formula-module
+assertion with an actual stripped-down SimPy run through the real
+dispatcher/machine code (not just the formula in isolation):
+
+- **Prefill**: single machine, backlog kept permanently saturated (≥32
+  always waiting) → realized throughput must converge to 142.70 req/s/chip.
+- **Decode**: single machine, occupancy pinned at exactly 320 (each
+  completed slot immediately replaced by a synthetic request) → realized
+  token throughput must converge to 53,157.6 tok/s.
+
+Both passed **bit-exact** (142.6935 vs. 142.70 target, 0.00% rel. err.;
+53,155.3478 vs. 53,157.6 target, 0.00% rel. err.) — the stripped-down
+real-sim checks matched the formula-only checks exactly, confirming the
+dispatcher/machine wiring is faithful to the underlying math, not just that
+the formula module alone is correct. `tests/test_service_time.py` pins
+these as exact-match regression tests (7 tests total across the formula
+module), plus `test_pool.py`/`test_prefill_dispatch.py`/
+`test_decode_admission.py` (8 more) exercising the real dispatcher code —
+15 tests total, all passing.
+
+### 4.3 First full sweep — dense, hard-cap, realistic pool sizes
+
+29 prefill : 5 decode machines, λ ∈ {500, 2000, 3500, 4500} req/s, pool
+capacity ∈ {0.25×, 1×, 2×, 4×, 6×} of one **"round"** — the KV-handoff
+payload of a worst-case simultaneous full-batch completion across all 29
+prefill machines at once: `29 × 32 × 40 MiB ≈ 36.25 GiB` (40 MiB = one
+request's KV cache at the 512-token prompt anchor, `512 × 81,920 B` exactly).
+5 seeds × 20,000 post-2,000-warmup completions/replication, 100 replications,
+2,000,000 total request records.
+
+**Result: `frac_pool_blocked` and `pool_wait` are exactly `0.0` for every
+single one of the 2,000,000 requests, at every (λ, pool) cell.** e2e latency
+grows mildly with λ (0.271s → 0.284s → 0.337s → 0.724s across the four
+rates) but is **identical across all 5 pool sizes at fixed λ** — the pool
+capacity parameter has zero measurable effect anywhere in this sweep.
+
+### 4.4 Control test — confirming this is a real finding, not a wiring bug
+
+Identical code, deliberately tiny 84 MB pool (~2 requests' worth) at λ=4500.
+**The system nearly deadlocked** — only 54 of 5,500 target completions
+reached within a full simulated hour (`max_sim_time_s` safety valve
+triggered). This rules out "pool.acquire() is silently a no-op": the
+mechanism genuinely blocks under real pressure. The §4.3 zero-contention
+result is therefore real: **the "one round" sizing anchor is drastically
+over-provisioned relative to what real load ever demands.** By Little's Law
+on the observed decode-admission-wait (~0.26ms at λ=4500), the *average*
+number of requests ever actually resident in the pool at once is ≈1 — not
+hundreds.
+
+### 4.5 Threshold exploration — where contention actually starts
+
+`explore_pool_threshold.py`: λ extended to {4500, 6000, 8000, 10000} (well
+past the ~4,138 req/s estimated prefill-side ceiling, see §4.7), pool sizes
+down-swept to {200MB, 500MB, 1GB, 2GB, 4GB, 9.73GB}. Lighter methodology
+(3 seeds, 3,000 target/300 warmup, 60s safety valve) — deliberately built to
+fail fast on pathological cells rather than burn wall-clock time confirming
+what a tiny pool already does.
+
+- **200 MB: total collapse, at every λ tested.** All 12 replications (4λ ×
+  3 seeds) never even cleared the 300-completion warm-up within 60s.
+- **500 MB: a real, unstable transition — not a graceful one.** Some seeds
+  finished cleanly with zero contention; others got caught early and never
+  recovered within budget (e.g. one λ=4500 seed reached only 739/3,300,
+  another 2,165/3,300). None of the seeds that *did* finish showed any
+  nonzero pool wait — near the threshold, this system doesn't degrade
+  gradually, it either avoids the constraint entirely or snowballs once hit
+  (the exact mechanism of that snowball — genuine simulated-time queueing
+  vs. `Container`-bookkeeping overhead compounding — wasn't chased further,
+  flagged rather than resolved).
+- **1 GB and up: clean, zero contention, at every λ up to 10,000** at this
+  sample size (~9,000 pooled requests/cell) — refined by §4.8's much larger
+  sample.
+
+### 4.6 Dynamic admission vs. hard-cap — the second open thread this phase closes
+
+§3.3 chose hard-cap admission (N=320, sized off worst-case per-request HBM
+reservation) over dynamic admission (N≈4,558, sized off average-case
+reservation) — §3's own sensitivity check found throughput identical either
+way (830.5 vs. 830.59 req/s/chip) because N=320 already sits past the
+compute-bound crossover, a flat asymptote. What throughput can't show is
+*queueing* latency — the genuine unknown `handoff.md` flagged as needing
+"the real thing, not a formula."
+
+`explore_dynamic_admission.py` (later reconfirmed at full methodology in
+§4.8): pool held fixed at the safe 1-round default to remove pool capacity
+as a confound, λ ∈ {500...10,000} × both caps × 5 seeds.
+**Result: every metric — admission wait, e2e latency at every
+percentile — is identical between the two policies at every λ tested**,
+matching to 5–6 decimal places. Dynamic admission has **no measurable
+benefit, on throughput (§3.3) or on queueing latency (this phase)** —
+because neither cap is ever actually the thing a request waits on (§4.7).
+
+### 4.7 Occupancy instrumentation — the real bottleneck isn't decode
+
+Added event-driven `(time, occupancy)` sampling to `DecodeMachine` (appended
+on every admit/complete, not periodic polling) to directly answer: is
+decode ever actually saturated, or just under-admitted? These are different
+questions — admission-cap headroom alone says nothing about whether
+occupancy sits above or below the compute-bound crossover.
+
+- **At λ≤3500: decode is genuinely underutilized.** Mean occupancy sits at
+  8–66% of the 320 cap, 0% of time above the ~296 crossover — real spare
+  compute capacity going unused.
+- **At λ≥4500: occupancy climbs, then plateaus — and stays flat all the
+  way to λ=10,000** (a 2.2× further increase in arrival rate producing
+  almost no change in mean occupancy). It does occasionally touch the 320
+  cap, and spends a real ~15–30% of time above the compute-bound crossover
+  — reasonably well-utilized, never saturated.
+- **Why it plateaus instead of climbing toward the cap**: decode's
+  occupancy is capped from above by how fast *prefill* feeds it completed
+  requests, and prefill has a **hard, fixed compute-bound throughput
+  ceiling (~4,138 req/s across all 29 machines)** — unlike decode, whose
+  effective rate flexes with occupancy, prefill just runs at a basically
+  fixed rate regardless of demand. Once λ exceeds that ceiling, excess
+  demand backs up waiting for a free *prefill* machine, not a decode slot.
+  Confirmed directly: `prefill_wait_mean` jumps from ~0.0001s (λ≤3500) to
+  0.166s (λ=4500) and **keeps growing without bound** as λ increases
+  further — the real signature of a genuinely overloaded stage, unlike
+  decode's self-limiting plateau.
+
+### 4.8 Final consolidated sweep — full methodology, refined threshold picture
+
+`run_sweep.py` (rewritten to supersede the exploratory scripts): full
+methodology (2,000-completion warm-up, 20,000 recorded/replication) across
+λ ∈ {500, 2000, 3500, 4500, 6000, 8000, 10000} × pool ∈ {1GB, 2GB,
+"1round"≈38.92GB} × decode cap ∈ {320 (primary, all pool sizes), 4,558
+(dynamic, at the 1-round pool size only)} × 5 seeds = 140 replications,
+**2,660,938 total request records**.
+
+**Refines §4.5's threshold with far more statistical power** (100,000
+pooled requests/cell vs. §4.5's ~3,000–9,000): at λ≥4500, **1GB and 2GB
+pools now show small but genuinely nonzero contention** — 1.34% of
+requests experience some pool wait at 1GB, 0.77% at 2GB — that the lighter
+sample in §4.5 didn't have the power to detect. The **1-round 38.92GB
+default remains at exactly zero contention even at λ=10,000** (2.4× the
+prefill ceiling). Corrected picture: the realistic default has essentially
+unlimited headroom; 1–2GB carries a small-but-real risk once the system is
+pushed past its ceiling; sub-1GB (§4.5) is where it becomes genuinely
+dangerous — not a hard cliff at 500MB–1GB as first characterized, a long
+tail extending further up than the lighter-sample run could see.
+
+**Reconfirms §4.6's dynamic-admission finding at full power** — e2e latency
+matches to 5 decimal places between the two caps at every λ (e.g. λ=10,000:
+2.183181 vs. 2.183167).
+
+**Reconfirms and sharpens §4.7's bottleneck finding**: mean occupancy
+plateaus at 275–279 for λ≥4500 (38.92GB/hard-cap), `frac_time_above_
+crossover` grows to ~30% at high λ, `prefill_wait_mean` keeps growing
+unboundedly (0.166s → 0.818s → 1.316s → 1.616s from λ=4,500→10,000) while
+decode's occupancy stays flat — prefill, not decode, is where congestion
+in this system actually lives.
+
+**A side finding worth recording**: the 1GB pool cells at several λ took
+meaningfully longer wall-clock/CPU time to reach their completion target
+than otherwise-identical 2GB/38.92GB cells (2/5 seeds per λ fell short of
+the 300s budget, reaching only ~10,000–13,000/22,000 completions). Plausibly
+explained by the same real (if rare) blocking episodes the pool-wait
+statistics directly confirm at that size — `simpy.Container` re-checks its
+full waiting-request queue on every release, adding real overhead exactly
+when genuine contention occurs. Not chased further via profiling since it
+doesn't change any substantive finding, only a performance characteristic
+of this implementation.
+
+### 4.9 External validation against DistServe/Mooncake
+
+Phase 0 flagged four "checkpoint numbers to sanity-check the eventual model
+against" (line 79–82, this file): DistServe's throughput multipliers, its
+<0.1%-of-latency KV-transfer claim, Mooncake's SLO-attainment/525%/75%
+figures, PagedAttention's fragmentation numbers. Honest accounting of what
+this pass actually checked, rather than silently declaring the checkpoint
+closed:
+
+- **KV-handoff <0.1%-of-latency claim**: already checked analytically in
+  Phase 2c (§2c.8) — 0.29–0.34% dense, contextualized as reasonable given a
+  stricter single-decode-step denominator vs. DistServe's own full-request
+  one. **Not re-derived here** — this DES doesn't model the sub-microsecond
+  bandwidth-bound transfer itself as a simulated duration (pool acquisition
+  is instantaneous once space is free; only *admission queueing*, not the
+  wire-time of the transfer, is modeled at this fidelity). Phase 2c's
+  analytical answer stands as the answer to this checkpoint.
+- **Interference-avoidance mechanism** (colocation inflating batch time
+  60ms→200ms): the qualitative reason disaggregation was chosen at all
+  (Phase 2c's framing) — not something this DES re-derives, since it never
+  modeled a colocated baseline.
+- **DistServe's throughput multipliers (2.0–3.41×, up to 4.48×) and
+  Mooncake's 525%/75% figures: not reproduced.** Both need a colocated/
+  monolithic baseline simulator to compare against, which this pass didn't
+  build — a genuine, explicitly-scoped-out extension (same "flag rather
+  than chase" pattern as declining CPU/SSD tiered offload in Phase 3), not
+  an oversight. Legitimate future work if a colocated comparison is wanted.
+- **PagedAttention's fragmentation/batch-size numbers**: not checkable
+  against this architecture either — this project's admission model is
+  prompt-length-based reservation, not block-level paging.
+- **The one thing actually checkable without a baseline — order-of-
+  magnitude latency plausibility**: for the same DistServe-anchored
+  512-in/64-out chatbot workload, this system's simulated e2e latency runs
+  0.27s (sub-ceiling, λ=500) → 0.72s (near-ceiling, λ=4500) → 2.0–2.2s
+  (2.4× overload, λ=10,000) — squarely in the sub-second-to-low-single-
+  digit-second range real production chat-serving systems operate in,
+  despite entirely different hardware/model/precision (TPU 8i FP4
+  Llama-3-70B vs. A100 FP16 OPT-175B). A legitimate, if qualitative,
+  order-of-magnitude sanity check — not literal reproduction, consistent
+  with spec_v2's own explicit framing of what this validation should be.
+
+### 4.10 Key Findings — Phase 4
+
+1. **The intermediate KV pool, sized at the "one round" worst-case-
+   simultaneous-completion anchor, is drastically over-provisioned.** Real
+   transient pool occupancy stays on the order of ~1 request even near the
+   system's throughput ceiling, because decode admission is almost always
+   immediately available — confirmed both directly (zero measured
+   contention across 2M+ requests at that size) and by a deliberate
+   tiny-pool control test that *did* collapse, ruling out a wiring bug.
+2. **The real contention threshold sits between 500MB and low-single-digit
+   GB, not between 9.73GB and 38.92GB** as the original "rounds" framing
+   implied — refined across two exploration passes at increasing
+   statistical power: 500MB is unstable/bimodal (not a graceful
+   degradation); 1–2GB carries small-but-real contention only once λ
+   exceeds the system ceiling; 38.92GB+ is unconditionally clean.
+3. **Dynamic admission (N≈4,558) provides zero measurable benefit over the
+   hard-cap policy (N=320)** — not just on throughput (§3.3's finding) but
+   on queueing latency either (this phase's unique contribution) — because
+   neither cap is ever actually the thing a request waits on.
+4. **The system's real bottleneck is prefill's fixed, compute-bound
+   throughput ceiling (~4,138 req/s across the 29-machine pool), not decode
+   capacity and not the pool.** Decode occupancy plateaus under sustained
+   overload (self-limiting, bounded by how fast prefill can feed it) while
+   prefill wait time grows unboundedly — the actual, mechanistically-
+   confirmed signature of where congestion in this system lives.
+5. **Prefill and decode needed genuinely different batching mechanisms, not
+   a shared abstraction** — a direct, structural consequence of the
+   compute-bound/memory-bound distinction §2 already established, not an
+   arbitrary implementation choice.
+6. **Building the simulator surfaced three real bugs before any result was
+   trusted**: a wrong attention formula in this project's own verbal design
+   discussion (caught by a planning sub-agent, independently re-verified
+   bit-exact), a `simpy.Resource` race condition that could have
+   over-admitted past the decode cap, and a missing pool-release call that
+   would have made the pool monotonically fill and never drain. All three
+   caught by validation discipline (bit-exact regression tests, a
+   deliberate degenerate-case control test, unit tests against the real
+   dispatcher code) rather than by inspection alone.
+7. **External validation against DistServe/Mooncake is necessarily
+   partial, stated honestly rather than glossed over**: the KV-handoff-
+   latency claim was already checked analytically (Phase 2c) and stands;
+   the throughput-multiplier and SLO-attainment comparisons need a
+   colocated-baseline simulator this pass explicitly didn't build; what's
+   actually checkable — order-of-magnitude latency plausibility — lands in
+   a believable regime despite entirely different underlying hardware.
+
+---
